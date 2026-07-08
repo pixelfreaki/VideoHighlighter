@@ -4,3 +4,5 @@ debug.log
 debug.prev.log
 
 __pycache__/
+
+.compound-engineering/*.local.yaml
