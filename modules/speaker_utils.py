@@ -16,6 +16,8 @@ import re
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 
+from modules.device_utils import detect_best_device
+
 
 # ==================================================
 # VOICE ACTIVITY DETECTION (VAD)
@@ -192,12 +194,21 @@ def extract_speaker_embeddings(audio_path: str,
         log_fn("⚠️ librosa not installed — needed for audio loading")
         return None
 
+    device = detect_best_device(log_fn=lambda _msg: None).general_torch_device
     try:
-        log_fn("  🧠 Loading speaker embedding model (GE2E)...")
-        encoder = VoiceEncoder(device="cpu")
+        log_fn(f"  🧠 Loading speaker embedding model (GE2E) on device: {device}...")
+        encoder = VoiceEncoder(device=device)
     except Exception as e:
-        log_fn(f"⚠️ Could not load embedding model: {e}")
-        return None
+        if device == "cpu":
+            log_fn(f"⚠️ Could not load embedding model: {e}")
+            return None
+        log_fn(f"⚠️ Speaker embedding model failed to load on device '{device}' ({e}); falling back to CPU.")
+        device = "cpu"
+        try:
+            encoder = VoiceEncoder(device=device)
+        except Exception as e:
+            log_fn(f"⚠️ Could not load embedding model: {e}")
+            return None
 
     try:
         # Load audio as float32 mono 16kHz (resemblyzer expects this)
