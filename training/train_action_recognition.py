@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from openvino.runtime import Core
+from openvino import Core
 from tqdm import tqdm
 from collections import deque
 

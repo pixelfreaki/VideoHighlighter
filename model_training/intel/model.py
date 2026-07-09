@@ -10,7 +10,7 @@ Intel Model Components
 import numpy as np
 import torch
 import torch.nn as nn
-from openvino.runtime import Core
+from openvino import Core
 
 
 # =============================

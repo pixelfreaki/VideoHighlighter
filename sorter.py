@@ -13,7 +13,7 @@ import json
 import shutil
 import csv
 from pathlib import Path
-from openvino.runtime import Core
+from openvino import Core
 
 # =============================
 # Paths - adjust to your setup
