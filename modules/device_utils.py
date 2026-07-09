@@ -8,6 +8,7 @@ One source of truth for all device strings passed to:
   - OpenVINO            (action recognition encoder/decoder)
   - PyTorch / R3D       (action recognition CUDA model)
   - Motion detection
+  - Other raw-PyTorch consumers (Whisper, Resemblyzer diarization)
 """
 
 import os
@@ -36,6 +37,8 @@ def detect_best_device(log_fn=print):
         .openvino_device   str   device hint for OpenVINO Core      "GPU" | "CPU" | "AUTO"
         .pytorch_device    str   device for PyTorch / R3D           "cuda" | "cpu"
         .motion_device     str   device for motion detection        "cuda:0" | "cpu"
+        .general_torch_device str device for other raw-PyTorch consumers
+                                   (Whisper, Resemblyzer)            "cuda:0" | "xpu:0" | "cpu"
         .use_openvino_yolo bool  True → load OpenVINO YOLO model
         .gpu_available     bool  True if any GPU was found
         .backend_name      str   human-readable label for logging
@@ -59,6 +62,7 @@ def detect_best_device(log_fn=print):
                     openvino_device="AUTO",
                     pytorch_device="cuda",
                     motion_device="cuda:0",
+                    general_torch_device="cuda:0",
                     use_openvino_yolo=False,
                     gpu_available=True,
                     backend_name="CUDA",
@@ -84,6 +88,7 @@ def detect_best_device(log_fn=print):
                     openvino_device="GPU",
                     pytorch_device="cpu",
                     motion_device="cpu",
+                    general_torch_device="xpu:0",
                     use_openvino_yolo=True,
                     gpu_available=True,
                     backend_name="Intel XPU (OpenVINO)",
@@ -106,6 +111,7 @@ def detect_best_device(log_fn=print):
                 openvino_device="GPU",
                 pytorch_device="cpu",
                 motion_device="cpu",
+                general_torch_device="cpu",
                 use_openvino_yolo=True,
                 gpu_available=True,
                 backend_name="Intel GPU (OpenVINO)",
@@ -121,6 +127,7 @@ def detect_best_device(log_fn=print):
         openvino_device="CPU",
         pytorch_device="cpu",
         motion_device="cpu",
+        general_torch_device="cpu",
         use_openvino_yolo=True,
         gpu_available=False,
         backend_name="CPU",
@@ -165,7 +172,7 @@ resolve_device = resolve_yolo_device
 class DeviceInfo:
     __slots__ = (
         "yolo_pt_device", "yolo_ov_device", "openvino_device",
-        "pytorch_device", "motion_device",
+        "pytorch_device", "motion_device", "general_torch_device",
         "use_openvino_yolo", "gpu_available", "backend_name",
     )
 
