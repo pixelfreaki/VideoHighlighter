@@ -1,5 +1,6 @@
-# Runtime debug logs (modules/debug_console writes them next to the exe /
-# project root at every launch)
+# Runtime debug/perf logs (modules/debug_console, modules/perf_summary write
+# them under logs/ next to the exe / project root)
+logs/
 debug.log
 debug.prev.log
 

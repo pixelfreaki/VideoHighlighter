@@ -32,6 +32,16 @@ def user_data_dir() -> str:
     return _project_root()
 
 
+LOGS_RETENTION_DAYS = 7  # shared by modules/debug_console.py and modules/perf_summary.py
+
+
+def logs_dir() -> str:
+    """Writable directory for rotated debug logs, creating it if missing."""
+    path = os.path.join(user_data_dir(), "logs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def data_file(name: str) -> str:
     """Resolve a data/model file that may ship bundled but can be overridden by
     dropping a file of the same name next to the executable (or in the project

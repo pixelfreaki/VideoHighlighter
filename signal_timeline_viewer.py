@@ -3389,23 +3389,20 @@ class SignalTimelineWindow(QMainWindow):
         """)
 
 
-# Also write to a debug file
-DEBUG_FILE = "timeline_debug.log"
-
-
 def debug_log(msg):
-    """Write debug message to both console and file"""
+    """Write a timestamped debug message to the console.
+
+    No separate file write here: this already flows into the app's managed,
+    rotated log (modules/debug_console.py's stdout tee) via the plain print()
+    call below, so a second direct file write would just duplicate that
+    content into an unrotated, unbounded file.
+    """
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     full_msg = f"[{timestamp}] {msg}"
-    
+
     # Use the original print function directly
     import builtins
     builtins.print(full_msg, flush=True)
-    
-    # Write to file
-    with open(DEBUG_FILE, "a", encoding="utf-8") as f:
-        f.write(full_msg + "\n")
-        f.flush()
 
 # Keep original print safe
 original_print = print
