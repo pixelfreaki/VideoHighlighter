@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from modules import device_utils
+from modules.device_utils import load_with_cpu_fallback
 
 
 def _silent_log(_msg):
@@ -123,3 +124,68 @@ def test_device_info_general_torch_device_is_a_slot():
         backend_name="CPU",
     )
     assert info.general_torch_device == "cpu"
+
+
+def test_load_with_cpu_fallback_happy_path_no_fallback_needed():
+    calls = []
+
+    def load_fn(d):
+        calls.append(d)
+        return f"model-on-{d}"
+
+    result = load_with_cpu_fallback(load_fn, "cuda:0", log_fn=_silent_log)
+
+    assert result == "model-on-cuda:0"
+    assert calls == ["cuda:0"]
+
+
+def test_load_with_cpu_fallback_retries_on_cpu_after_failure():
+    calls = []
+
+    def load_fn(d):
+        calls.append(d)
+        if d != "cpu":
+            raise RuntimeError("xpu backend not available")
+        return "model-on-cpu"
+
+    result = load_with_cpu_fallback(load_fn, "xpu:0", log_fn=_silent_log)
+
+    assert result == "model-on-cpu"
+    assert calls == ["xpu:0", "cpu"]
+
+
+def test_load_with_cpu_fallback_final_failure_returns_none_by_default():
+    def load_fn(d):
+        raise RuntimeError(f"{d}_FAIL")
+
+    result = load_with_cpu_fallback(load_fn, "xpu:0", log_fn=_silent_log)
+
+    assert result is None
+
+
+def test_load_with_cpu_fallback_raises_the_final_failure_not_the_original():
+    # Regression: a bare `raise` here would re-raise the original device's
+    # exception instead of the CPU fallback's, since Python's "currently
+    # handled exception" reverts to the outer except once the inner except
+    # block exits — misleading whoever reads the propagated error.
+    def load_fn(d):
+        if d == "xpu:0":
+            raise RuntimeError("XPU_FAIL")
+        raise RuntimeError("CPU_FAIL")
+
+    try:
+        load_with_cpu_fallback(load_fn, "xpu:0", log_fn=_silent_log, raise_on_failure=True)
+        assert False, "expected RuntimeError to propagate"
+    except RuntimeError as exc:
+        assert str(exc) == "CPU_FAIL"
+
+
+def test_load_with_cpu_fallback_cpu_only_failure_raises_directly():
+    def load_fn(d):
+        raise RuntimeError("CPU_FAIL")
+
+    try:
+        load_with_cpu_fallback(load_fn, "cpu", log_fn=_silent_log, raise_on_failure=True)
+        assert False, "expected RuntimeError to propagate"
+    except RuntimeError as exc:
+        assert str(exc) == "CPU_FAIL"

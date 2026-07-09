@@ -1,10 +1,11 @@
 """
-Tests for modules/speaker_utils.py's device selection (U3).
+Tests for modules/speaker_utils.py's device selection.
 
-Covers modules/speaker_utils.py:197-211 — Resemblyzer's VoiceEncoder now
-resolves its device through device_utils.detect_best_device().general_torch_device
-instead of a hard-coded "cpu", with a CPU fallback if loading on the resolved
-device raises (KTD2).
+Covers modules/speaker_utils.py's extract_speaker_embeddings — Resemblyzer's
+VoiceEncoder now resolves its device through
+device_utils.detect_best_device().general_torch_device instead of a
+hard-coded "cpu", with a CPU fallback if loading on the resolved device raises
+(Resemblyzer-on-XPU is unvalidated on real hardware in this environment).
 """
 
 from __future__ import annotations

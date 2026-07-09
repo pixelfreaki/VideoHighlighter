@@ -1,10 +1,10 @@
 """
-Tests for modules/transcript.py's device selection (U2).
+Tests for modules/transcript.py's device selection.
 
-Covers modules/transcript.py:87-99 — Whisper now resolves its device through
-device_utils.detect_best_device().general_torch_device instead of an isolated
-torch.cuda.is_available() check, with a CPU fallback if loading on the
-resolved device raises (KTD2 — Whisper/Resemblyzer-on-XPU is unvalidated on
+Covers modules/transcript.py's get_transcript_segments — Whisper now resolves
+its device through device_utils.detect_best_device().general_torch_device
+instead of an isolated torch.cuda.is_available() check, with a CPU fallback
+if loading on the resolved device raises (Whisper-on-XPU is unvalidated on
 real hardware in this environment).
 """
 

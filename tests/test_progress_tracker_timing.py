@@ -1,10 +1,10 @@
 """
-Tests for ProgressTracker's per-stage duration tracking (U4).
+Tests for ProgressTracker's per-stage duration tracking.
 
 Covers pipeline.py's ProgressTracker.start_stage/end_stage — an explicit
-stage-boundary API rather than inferring durations from task_name transitions
-(see the plan's KTD3: task_name is "Pipeline" for most real stages, and
-several stages bypass ProgressTracker's update_progress entirely).
+stage-boundary API rather than inferring durations from task_name transitions,
+since task_name is "Pipeline" for most real stages and several stages bypass
+ProgressTracker's update_progress entirely.
 """
 
 from __future__ import annotations

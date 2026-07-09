@@ -45,7 +45,7 @@ def build_summary(progress_tracker, video_path=None) -> dict:
 
 
 def log_summary(summary: dict, log_fn=print) -> None:
-    """Log one structured, human-readable table for the run (R3)."""
+    """Log one structured, human-readable table for the run."""
     log_fn("📊 Performance summary:")
     for name, info in summary["stages"].items():
         duration = info["duration_seconds"]
@@ -55,7 +55,7 @@ def log_summary(summary: dict, log_fn=print) -> None:
 
 
 def append_summary(summary: dict, log_fn=print) -> None:
-    """Append one run's summary to the local cross-run record (R4)."""
+    """Append one run's summary to the local cross-run record."""
     try:
         path = _summary_file_path()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -68,7 +68,7 @@ def append_summary(summary: dict, log_fn=print) -> None:
 def emit_summary(progress_tracker, video_path=None, log_fn=print) -> None:
     """Build, log, and append one run's structured performance summary.
 
-    Never raises (KTD4) — a failed summary must not fail the pipeline run.
+    Never raises — a failed summary must not fail the pipeline run.
     """
     try:
         summary = build_summary(progress_tracker, video_path=video_path)

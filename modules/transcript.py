@@ -4,7 +4,7 @@ from tqdm import tqdm
 import re
 import subprocess
 
-from modules.device_utils import detect_best_device
+from modules.device_utils import detect_best_device, load_with_cpu_fallback
 
 def is_repetitive_hallucination(text, threshold=0.7):
     """Detect repetitive segments like 'ha ha ha'"""
@@ -89,14 +89,10 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
 
     log_fn(f"🔤 Language parameter received: {language}")
 
-    try:
-        model = whisper.load_model(model_name, device=device)
-    except Exception as e:
-        if device == "cpu":
-            raise
-        log_fn(f"⚠️ Whisper failed to load on device '{device}' ({e}); falling back to CPU.")
-        device = "cpu"
-        model = whisper.load_model(model_name, device=device)
+    model = load_with_cpu_fallback(
+        lambda d: whisper.load_model(model_name, device=d),
+        device, log_fn=log_fn, raise_on_failure=True,
+    )
     log_fn("Splitting video into chunks...")
 
     chunks = split_audio(video_file, chunk_length=chunk_length)

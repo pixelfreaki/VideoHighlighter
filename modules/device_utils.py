@@ -165,6 +165,39 @@ def resolve_yolo_device(requested: str) -> str:
 resolve_device = resolve_yolo_device
 
 
+def load_with_cpu_fallback(load_fn, device, log_fn=print, raise_on_failure=False):
+    """
+    Call load_fn(device), retrying once on device="cpu" if it raises.
+
+    No existing consumer in this codebase uses raw PyTorch XPU tensors — the
+    established Intel-GPU pattern here is always "route through OpenVINO,"
+    never "hand XPU tensors to an arbitrary PyTorch model." A general_torch_device
+    of "xpu:0" is therefore an unvalidated combination with no local hardware
+    available to test it, so callers retry on CPU rather than crashing a run
+    over an unproven hardware path.
+
+    On final failure (including a failure on "cpu" itself), logs and returns
+    None unless raise_on_failure is True, in which case the exception propagates.
+    """
+    try:
+        return load_fn(device)
+    except Exception as e:
+        if device != "cpu":
+            log_fn(f"⚠️ Model failed to load on device '{device}' ({e}); falling back to CPU.")
+            try:
+                return load_fn("cpu")
+            except Exception as e2:
+                e = e2
+        if raise_on_failure:
+            # Bare `raise` would re-raise the original device's exception here,
+            # not the CPU fallback's — Python's "currently handled exception"
+            # reverts to the outer except's context once the inner except
+            # block exits, regardless of the `e = e2` rebind above.
+            raise e
+        log_fn(f"⚠️ Could not load model: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # DeviceInfo value object
 # ---------------------------------------------------------------------------

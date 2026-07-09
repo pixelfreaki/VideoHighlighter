@@ -1029,6 +1029,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"❌ YOLO export to OpenVINO failed: {e}")
 
         # Load YOLO model — YOLO-World or Standard YOLO
+        yolo_device_for_inference = None
         try:
             check_cancellation(cancel_flag, log, "YOLO model loading")
             
@@ -1085,10 +1086,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("ℹ Skipping object detection (no objects to highlight)")
                 object_detections = {}
             else:
-                progress.record_stage_device(
-                    "object_detection",
-                    yolo_device_for_inference if 'yolo_device_for_inference' in locals() else None,
-                )
+                progress.record_stage_device("object_detection", yolo_device_for_inference)
                 frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
                 object_detections, object_bboxes_cache = {}, []
                 custom_only = (yolo_type == "custom")
@@ -1278,6 +1276,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 action_backend = gui_config.get("action_backend", "auto")
                 r3d_model = gui_config.get("r3d_model", "r3d_18")
 
+                _dev = None
                 if action_backend == "openvino":
                     enable_r3d = False
                     r3d_half = False
@@ -1302,7 +1301,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         r3d_half = False
                         log(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
 
-                _action_dev = detect_best_device(log_fn=lambda _msg: None)
+                # Reuse the "auto" branch's already-resolved DeviceInfo instead of
+                # probing hardware again; only the explicit-backend branches
+                # (which never resolved one) need a fresh detection here.
+                _action_dev = _dev if _dev is not None else detect_best_device(log_fn=lambda _msg: None)
                 progress.record_stage_device(
                     "action_detection",
                     _action_dev.pytorch_device if enable_r3d else _action_dev.openvino_device,

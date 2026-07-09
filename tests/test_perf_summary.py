@@ -1,6 +1,6 @@
 """
 Tests for modules/perf_summary.py — structured end-of-run performance
-summary combining ProgressTracker's per-stage durations and devices (U5).
+summary combining ProgressTracker's per-stage durations and devices.
 """
 
 from __future__ import annotations
@@ -42,6 +42,19 @@ def test_build_summary_marks_device_as_none_when_stage_has_no_registered_device(
 
     assert summary["stages"]["video_cutting"]["duration_seconds"] == 5.0
     assert summary["stages"]["video_cutting"]["device"] is None
+
+
+def test_build_summary_marks_duration_as_none_when_stage_has_no_recorded_duration():
+    # e.g. diarization, whose device is registered separately but whose
+    # duration is folded into the "transcript" stage's timing.
+    tracker = _FakeTracker(
+        stage_durations={},
+        stage_devices={"diarization": "cuda:0"},
+    )
+    summary = perf_summary.build_summary(tracker)
+
+    assert summary["stages"]["diarization"]["device"] == "cuda:0"
+    assert summary["stages"]["diarization"]["duration_seconds"] is None
 
 
 def test_emit_summary_write_failure_is_logged_not_raised(tmp_path):
