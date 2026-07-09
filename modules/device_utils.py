@@ -165,6 +165,16 @@ def resolve_yolo_device(requested: str) -> str:
 resolve_device = resolve_yolo_device
 
 
+def should_export_yolo_to_openvino(devices, openvino_model_folder: str) -> bool:
+    """Whether the YOLO model should be exported to OpenVINO format.
+
+    True only when the run will actually use the OpenVINO YOLO path
+    (``devices.use_openvino_yolo``) and no export exists yet -- keeps a
+    CUDA-active run from paying for an export it will never load.
+    """
+    return devices.use_openvino_yolo and not os.path.exists(openvino_model_folder)
+
+
 def load_with_cpu_fallback(load_fn, device, log_fn=print, raise_on_failure=False):
     """
     Call load_fn(device), retrying once on device="cpu" if it raises.

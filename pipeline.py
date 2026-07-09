@@ -20,7 +20,7 @@ from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
-from modules.device_utils import resolve_yolo_device, detect_best_device
+from modules.device_utils import resolve_yolo_device, detect_best_device, should_export_yolo_to_openvino
 from modules.app_paths import ffmpeg_exe
 from modules.perf_summary import emit_summary
 
@@ -1037,7 +1037,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         # Export model to OpenVINO only when the OpenVINO YOLO path will
         # actually be used (e.g. CUDA is active) -- skip the (slow) export
         # entirely so a CUDA run doesn't pay for a model artifact it never loads.
-        if devices.use_openvino_yolo and not os.path.exists(openvino_model_folder):
+        if should_export_yolo_to_openvino(devices, openvino_model_folder):
             try:
                 check_cancellation(cancel_flag, log, "YOLO model export")
                 log(f"⚠️ OpenVINO folder not found. Exporting YOLO model (requires {default_pt_path})...")
