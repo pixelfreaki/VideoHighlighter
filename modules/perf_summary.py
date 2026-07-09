@@ -15,11 +15,13 @@ import json
 import os
 import time
 
-from modules.app_paths import user_data_dir
+from modules.app_paths import logs_dir
+
+_RETENTION_DAYS = 7
 
 
 def _summary_file_path() -> str:
-    return os.path.join(user_data_dir(), "perf_summary.jsonl")
+    return os.path.join(logs_dir(), "perf_summary.jsonl")
 
 
 def build_summary(progress_tracker, video_path=None) -> dict:
@@ -55,14 +57,41 @@ def log_summary(summary: dict, log_fn=print) -> None:
 
 
 def append_summary(summary: dict, log_fn=print) -> None:
-    """Append one run's summary to the local cross-run record."""
+    """Append one run's summary to the local cross-run record, then prune
+    entries older than the retention window so the file doesn't grow
+    unbounded."""
     try:
         path = _summary_file_path()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
+        _prune_old_entries(path, log_fn=log_fn)
     except Exception as e:
         log_fn(f"⚠️ Failed to append performance summary: {e}")
+
+
+def _prune_old_entries(path: str, log_fn=print) -> None:
+    """Rewrite the JSONL record keeping only entries within the retention
+    window. Best-effort: a malformed line is dropped rather than blocking
+    the prune, and any failure here is logged and swallowed."""
+    try:
+        cutoff = time.time() - (_RETENTION_DAYS * 86400)
+        kept = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("timestamp", 0) >= cutoff:
+                    kept.append(line)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+    except Exception as e:
+        log_fn(f"⚠️ Failed to prune performance summary: {e}")
 
 
 def emit_summary(progress_tracker, video_path=None, log_fn=print) -> None:
