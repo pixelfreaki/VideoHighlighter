@@ -9,6 +9,22 @@ import sys
 from modules import debug_console
 debug_console.install()
 
+# Parse --conf / --help right after debug_console.install(): in the packaged
+# --windowed build, sys.stdout/sys.stderr are None until install() replaces
+# them, so anything printed before that point (argparse's --help output, or
+# a --conf error below) would raise on None.write() or be silently lost.
+from modules import cli_args as _cli_args_module
+from modules.app_paths import set_config_override as _set_config_override
+_cli_args = _cli_args_module.parse_args(sys.argv[1:])
+if _cli_args.conf:
+    try:
+        with open(_cli_args.conf, "r"):
+            pass
+    except OSError as e:
+        print(f"❌ Cannot read --conf path '{_cli_args.conf}': {e}")
+        sys.exit(1)
+    _set_config_override(_cli_args.conf)
+
 import cv2
 import json
 import subprocess
