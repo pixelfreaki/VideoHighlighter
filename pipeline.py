@@ -20,8 +20,9 @@ from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
-from modules.device_utils import resolve_yolo_device
+from modules.device_utils import resolve_yolo_device, detect_best_device
 from modules.app_paths import ffmpeg_exe
+from modules.perf_summary import emit_summary
 
 
 
@@ -33,7 +34,10 @@ class ProgressTracker:
     def __init__(self, progress_fn=None, log_fn=print):
         self.progress_fn = progress_fn
         self.log_fn = log_fn
-        
+        self.stage_durations = {}
+        self.stage_devices = {}
+        self._open_stage_starts = {}
+
     def update_progress(self, current, total, task_name, details=""):
         """Update progress if callback is available"""
         if self.progress_fn:
@@ -41,6 +45,30 @@ class ProgressTracker:
                 self.progress_fn(current, total, task_name, details)
             except:
                 pass  # Ignore callback errors
+
+    def start_stage(self, name):
+        """Mark the start of a wall-clock-timed pipeline stage.
+
+        If `name` is already open (start_stage called twice without an
+        intervening end_stage), the timer resets to now rather than stacking
+        — the most recent start wins.
+        """
+        self._open_stage_starts[name] = time.time()
+
+    def end_stage(self, name):
+        """Close a stage opened with start_stage and record its duration.
+
+        A call with no matching start_stage is ignored (not a KeyError) —
+        instrumentation must never be the reason a real run fails.
+        """
+        start = self._open_stage_starts.pop(name, None)
+        if start is None:
+            return
+        self.stage_durations[name] = time.time() - start
+
+    def record_stage_device(self, name, device):
+        """Record which compute device a stage actually used."""
+        self.stage_devices[name] = device
 
 # Transcript modules (optional)
 try:
@@ -498,6 +526,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         processed_video_path = video_path
         temp_trimmed_video = None
 
+        progress.start_stage("trim")
         if USE_TIME_RANGE:
             if RANGE_END is None or RANGE_END == 0:
                 RANGE_END = video_duration
@@ -588,6 +617,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 return None
         else:
             log("ℹ️ Processing full video")
+        progress.end_stage("trim")
 
         # ========== CACHE CHECK ==========
         # Goal:
@@ -734,9 +764,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # ========== END CACHE CHECK ==========
 
         # --- Transcript processing ---
+        progress.start_stage("transcript")
         if not using_cache:
             # Original transcript processing code
             if USE_TRANSCRIPT:
+                # Predicted device: transcript.py/speaker_utils.py resolve their own
+                # device internally (with their own CPU fallback on load failure),
+                # so this may not reflect a real fallback that happens deeper inside.
+                _transcript_dev = detect_best_device(log_fn=lambda _msg: None).general_torch_device
+                progress.record_stage_device("transcript", _transcript_dev)
+                progress.record_stage_device("diarization", _transcript_dev)
                 progress.update_progress(5, 100, "Pipeline", "Processing transcript...")
                 log("🔹 Step 0.5: Processing transcript...")
                 try:
@@ -800,13 +837,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"✅ Found {len(keyword_matches)} keyword matches")
             else:
                 keyword_matches = []
+        progress.end_stage("transcript")
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
         start_time = time.time()
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
+        progress.start_stage("motion")
         if not using_cache:
+            progress.record_stage_device("motion", motion_device)
             progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
             
             # Check if we should skip motion detection based on GUI config
@@ -858,12 +898,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         else:
             log("ℹ️ Using cached motion analysis")
             progress.update_progress(25, 100, "Pipeline", "Loaded cached motion analysis")
+        progress.end_stage("motion")
 
         check_cancellation(cancel_flag, log, "motion detection completion")
 
         # 3 Audio peaks
         # - If audio_peak_points == 0: skip *peaks* but still compute waveform (for timeline viewer)
         # - If using cache: load peaks + waveform from cache (support both new and legacy key layouts)
+        progress.start_stage("audio_peaks")
 
         audio_peaks = audio_peaks if 'audio_peaks' in locals() else []
         waveform_data = None
@@ -938,8 +980,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
                 except RuntimeError:
                     return None
+        progress.end_stage("audio_peaks")
 
         # 4 Object detection setup
+        progress.start_stage("object_detection")
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
         check_cancellation(cancel_flag, log, "object detection setup")
 
@@ -1041,6 +1085,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("ℹ Skipping object detection (no objects to highlight)")
                 object_detections = {}
             else:
+                progress.record_stage_device(
+                    "object_detection",
+                    yolo_device_for_inference if 'yolo_device_for_inference' in locals() else None,
+                )
                 frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
                 object_detections, object_bboxes_cache = {}, []
                 custom_only = (yolo_type == "custom")
@@ -1142,6 +1190,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         else:
             log("ℹ️ Using cached object detections")
+        progress.end_stage("object_detection")
 
         print("Detections per second:", len(object_detections))
 
@@ -1213,6 +1262,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         action_bboxes_cache = []
         all_action_detections = []  # full raw detection stream (for the timeline "show all")
 
+        progress.start_stage("action_detection")
         if not using_cache and interesting_actions:
             try:
                 # Get action label settings
@@ -1251,6 +1301,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         enable_r3d = False
                         r3d_half = False
                         log(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
+
+                _action_dev = detect_best_device(log_fn=lambda _msg: None)
+                progress.record_stage_device(
+                    "action_detection",
+                    _action_dev.pytorch_device if enable_r3d else _action_dev.openvino_device,
+                )
 
                 log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 
@@ -1392,6 +1448,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         elif not interesting_actions:
             log("ℹ️ No interesting actions specified, skipping action recognition")
             action_detections = []
+        progress.end_stage("action_detection")
 
         # ========== SAVE TO CACHE IF NOT USING CACHE ==========
         if not using_cache and use_cache and not (cancel_flag and cancel_flag.is_set()):
@@ -1440,6 +1497,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # ========== END CACHE SAVE ==========
 
         # ========== AVOID: locate the person(s) to avoid ==========
+        progress.start_stage("face_work")
         if AVOID_ENABLED and AVOID_IDS:
             try:
                 from video_ai_editor.face_identity import FaceIdentityBank
@@ -1453,6 +1511,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except Exception as e:
                 log(f"⚠️ Avoid resolver unavailable — running without exclusion: {e}")
                 forbidden_ranges, forbidden_boxes_by_frame = [], {}
+        progress.end_stage("face_work")
         # ========== END AVOID LOCATE ==========
 
         # Manual user-marked avoid ranges (drawn on the timeline). Applied as a
@@ -1470,6 +1529,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 f"{len(forbidden_ranges)} forbidden range(s) total")
 
         # 6 Compute scores per second
+        progress.start_stage("score_computation")
         progress.update_progress(80, 100, "Pipeline", "Computing scores...")
         check_cancellation(cancel_flag, log, "score computation")
         
@@ -1665,6 +1725,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             log(f"🚫 Avoid(skip): zeroed score on {len(forbidden_seconds)} second(s)")
 
         progress.update_progress(80, 100, "Score Calculation", "Score computation complete")
+        progress.end_stage("score_computation")
         check_cancellation(cancel_flag, log, "score computation completion")
 
         # -------------------------
@@ -2099,6 +2160,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         check_cancellation(cancel_flag, log, "segment selection")
 
         # Cut and concatenate
+        progress.start_stage("video_cutting")
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
         log("🔹 Step 7: Cutting video segments...")
         try:
@@ -2180,8 +2242,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         except Exception as e:
             log(f"⚠️ Error during cutting/concatenation: {e}")
             raise
+        progress.end_stage("video_cutting")
 
         # Create matching subtitles for highlight video OR full video
+        progress.start_stage("subtitles")
         if CREATE_SUBTITLES and USE_TRANSCRIPT and transcript_segments:
             try:
                 base_name = os.path.splitext(OUTPUT_FILE)[0]
@@ -2224,6 +2288,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
             except Exception as e:
                 log(f"Error creating subtitles: {e}")
+        progress.end_stage("subtitles")
 
 
         # Final progress
@@ -2235,6 +2300,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         log(f"⏱️ Processing time: {minutes}m {seconds}s")
+
+        emit_summary(progress, video_path=original_video_path, log_fn=log)
 
         # Clean up GPU memory
         try:
