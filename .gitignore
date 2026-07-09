@@ -7,3 +7,9 @@ __pycache__/
 
 .compound-engineering/*.local.yaml
 temp/*
+cache/*
+perf_summary.jsonl
+timeline_debug.log
+yolo11n.pt
+yolo11n_openvino_model
+config/*
