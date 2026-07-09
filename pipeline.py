@@ -1022,7 +1022,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # Check OpenVINO devices (best-effort)
         try:
-            from openvino.runtime import Core
+            from openvino import Core
             ie = Core()
             log(f"🔹 OpenVINO available devices: {ie.available_devices}")
         except ImportError:
@@ -1030,12 +1030,18 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         except Exception as e:
             log(f"⚠️ OpenVINO device check failed: {e}")
 
-        # Export model to OpenVINO if missing
-        if not os.path.exists(openvino_model_folder):
+        # Resolved once here and reused below (export gate + model loading) so
+        # detect_best_device() doesn't re-probe hardware three times per run.
+        devices = detect_best_device(log_fn=log)
+
+        # Export model to OpenVINO only when the OpenVINO YOLO path will
+        # actually be used (e.g. CUDA is active) -- skip the (slow) export
+        # entirely so a CUDA run doesn't pay for a model artifact it never loads.
+        if devices.use_openvino_yolo and not os.path.exists(openvino_model_folder):
             try:
                 check_cancellation(cancel_flag, log, "YOLO model export")
                 log(f"⚠️ OpenVINO folder not found. Exporting YOLO model (requires {default_pt_path})...")
-                
+
                 # Use the PT path from config, or fall back to default based on model size
                 yolo_pt_path = gui_config.get("yolo_pt_path", default_pt_path)
                 yolo_model_export = YOLO(yolo_pt_path)
@@ -1068,7 +1074,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     log("⚠️ YOLO-World loaded but no objects specified — nothing will be detected")
                 
                 # Move to GPU if available
-                devices = detect_best_device(log_fn=log)
                 if "cuda" in yolo_device:
                     yolo_model.to(yolo_device)
                     yolo_device_for_inference = yolo_device
@@ -1078,7 +1083,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"✅ YOLO-World loaded on CPU")
             else:
                 # Standard YOLO11 (supports OpenVINO)
-                devices = detect_best_device(log_fn=log)
                 if devices.use_openvino_yolo:
                     yolo_model = YOLO(openvino_model_folder, task="detect")
                     yolo_device_for_inference = "cpu"
