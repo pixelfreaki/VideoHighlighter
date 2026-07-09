@@ -214,7 +214,8 @@ class SignalTimelineWindow(QMainWindow):
     """Main window for signal timeline viewer with edit timeline and filters"""
     waveform_ready = Signal(object)
     render_finished = Signal(bool, str)
-    
+    render_progress = Signal(int)
+
     def __init__(self, video_path, cache_data=None):
         debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
         debug_log(f"  cache_data provided: {cache_data is not None}")
@@ -407,6 +408,18 @@ class SignalTimelineWindow(QMainWindow):
                     self.realtime_preview._memory_timer.stop()
             except Exception:
                 pass
+
+            # Auto-save the edit timeline so manual clip edits aren't lost on
+            # close. Only writes when the user actually changed the clips.
+            try:
+                if (hasattr(self, 'edit_scene') and self.edit_scene is not None
+                        and self.edit_scene.clips
+                        and self.edit_scene.has_unsaved_edits()):
+                    if self.edit_scene.save_clips_to_cache():
+                        print(f"💾 Auto-saved {len(self.edit_scene.clips)} edit "
+                              f"clips on close")
+            except Exception as e:
+                print(f"⚠️ Edit autosave on close failed: {e}")
 
             # Tear down the thumbnail worker + hover popup
             try:
@@ -1204,6 +1217,10 @@ class SignalTimelineWindow(QMainWindow):
             if not findings or not hasattr(self, 'signal_scene'):
                 return
             self.signal_scene.add_visual_findings(findings)
+            # Auto-enable the Visual Search signal now that it has data. Its
+            # checkbox starts unchecked/hidden when the UI was built before any
+            # findings existed, so surface the freshly-added results.
+            self._enable_layer('visual_search')
             if save:
                 self.save_visual_findings_to_cache()
             if hasattr(self, 'label_panel'):
@@ -1211,6 +1228,27 @@ class SignalTimelineWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"🔍 Added {len(findings)} visual finding(s) to timeline", 3000
             )
+
+    def _resolve_video_hash(self):
+        """Return the video hash for the current video, caching it into
+        cache_data. Falls back to computing it from the video file when the
+        loaded/provided cache_data lacks a 'video_hash' key (e.g. minimal or
+        caller-supplied cache_data). Returns None if it can't be determined."""
+        video_hash = self.cache_data.get('video_hash') if self.cache_data else None
+        if video_hash:
+            return video_hash
+        try:
+            if self.video_path and os.path.exists(self.video_path):
+                from modules.video_cache import VideoAnalysisCache
+                cache = self.cache or VideoAnalysisCache()
+                video_hash = cache._get_video_hash(self.video_path)
+                if self.cache_data is None:
+                    self.cache_data = {}
+                self.cache_data['video_hash'] = video_hash
+                return video_hash
+        except Exception as e:
+            print(f"⚠️ Could not compute video_hash from file: {e}")
+        return None
 
     def save_visual_findings_to_cache(self):
         """Persist visual_findings to the on-disk cache file."""
@@ -1229,19 +1267,27 @@ class SignalTimelineWindow(QMainWindow):
                 print("⚠️ Cache directory not found, findings not persisted")
                 return False
 
-            video_hash = self.cache_data.get('video_hash')
+            video_hash = self._resolve_video_hash()
             if not video_hash:
                 print("⚠️ No video_hash in cache_data, cannot save findings")
                 return False
 
             matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
-            if not matching:
-                print(f"⚠️ No cache file found for hash {video_hash[:16]}...")
-                return False
+            if matching:
+                cache_file = matching[0]
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    disk_data = json.load(f)
+            else:
+                # No analysis cache exists yet (e.g. visual search run without a
+                # prior full analysis). Seed a legacy <hash>.cache.json so the
+                # findings survive a restart; load_cache_data() will pick it up.
+                print(f"ℹ️ No cache file for hash {video_hash[:16]}..., creating one")
+                cache_file = cache_dir / f"{video_hash}.cache.json"
+                disk_data = dict(self.cache_data)
+                disk_data.setdefault('video_path', str(self.video_path))
+                disk_data['video_hash'] = video_hash
+                disk_data['cache_complete'] = True
 
-            cache_file = matching[0]
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                disk_data = json.load(f)
             disk_data['visual_findings'] = findings
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(disk_data, f)
@@ -1271,7 +1317,7 @@ class SignalTimelineWindow(QMainWindow):
                 print("⚠️ Cache directory not found, waveform not persisted")
                 return
 
-            video_hash = self.cache_data.get('video_hash')
+            video_hash = self._resolve_video_hash()
             if not video_hash:
                 print("⚠️ No video_hash in cache_data, cannot save waveform to disk")
                 return
@@ -1633,8 +1679,9 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             print(f"⚠️ Could not create search dock: {e}")
 
-        # Connect render signal
+        # Connect render signals
         self.render_finished.connect(self.on_render_finished)
+        self.render_progress.connect(self.on_render_progress)
 
         # Apply dark theme
         self.apply_dark_theme()
@@ -2416,6 +2463,21 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene.visible_layers[layer_name] = (state == Qt.CheckState.Checked.value)
         self.signal_scene.build_timeline()
 
+    def _enable_layer(self, layer_name, rebuild=True):
+        """Programmatically make a layer visible and sync its checkbox. Used
+        when a signal gains data after the UI was built (e.g. visual search
+        findings arriving post-processing)."""
+        self.signal_scene.visible_layers[layer_name] = True
+        checkbox = getattr(self, 'layer_checkboxes', {}).get(layer_name)
+        if checkbox is not None and not checkbox.isChecked():
+            # blockSignals so we don't double-trigger toggle_layer/build_timeline
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.setToolTip("")
+            checkbox.blockSignals(False)
+        if rebuild:
+            self.signal_scene.build_timeline()
+
     # ---- Avoid ranges -----------------------------------------------------
     def _avoid_selected_range(self):
         """Add the current drag-selection to the avoid list and redraw."""
@@ -2479,11 +2541,12 @@ class SignalTimelineWindow(QMainWindow):
     
     @Slot(float)
     def on_time_clicked(self, time):
-        # Pause edit playback if running, but DON'T destroy state
-        if hasattr(self, '_edit_playlist') and self._edit_playlist:
-            if not getattr(self, '_edit_paused', True):
-                self._pause_edit_playback()
-        
+        # Clicking the signal timeline hands control back to the main video
+        # timeline: if an edit was playing/paused, leave edit-playback mode so
+        # the next Space plays the video from here instead of resuming the edit.
+        if getattr(self, '_edit_playback_active', False):
+            self._leave_edit_playback()
+
         self.current_time = max(0, min(self.video_duration, time))
         self.signal_scene.current_time_seconds = self.current_time
         self.signal_scene.set_current_time(self.current_time)
@@ -2509,6 +2572,29 @@ class SignalTimelineWindow(QMainWindow):
             self._edit_clip_timer.stop()
         if hasattr(self, '_edit_progress_timer'):
             self._edit_progress_timer.stop()
+
+    def _leave_edit_playback(self):
+        """Exit edit-timeline playback without moving the playhead.
+
+        Used when the user clicks the signal timeline mid-edit: control returns
+        to the main video timeline (Space then plays the video from the click),
+        instead of resuming the edit playlist. Unlike stop_edit_playback() this
+        keeps current_time where it is; unlike _pause_edit_playback() it clears
+        the edit sentinel so Space routes to toggle_video_playback()."""
+        if hasattr(self, '_edit_clip_timer') and self._edit_clip_timer.isActive():
+            self._edit_clip_timer.stop()
+        if hasattr(self, '_edit_progress_timer') and self._edit_progress_timer.isActive():
+            self._edit_progress_timer.stop()
+        if hasattr(self, 'edit_scene'):
+            self.edit_scene.clear_active_clip()
+        self._edit_playback_active = False
+        self._edit_paused = False
+        self._single_clip_playing = False
+        self._edit_playlist_index = 0
+        self._active_player.pause()
+        self.play_edit_btn.setText("▶ Play Edit")
+        if hasattr(self, 'play_btn'):
+            self.play_btn.setText("▶ Play")
 
     def _get_active_audio_output(self):
         """Return the QAudioOutput attached to whichever player is currently active."""
@@ -3247,9 +3333,9 @@ class SignalTimelineWindow(QMainWindow):
         if not output_path:
             return
 
-        self.statusBar().showMessage("🎬 Rendering highlight video...")
+        self.statusBar().showMessage("🎬 Rendering highlight video…")
         self.render_highlight_btn.setEnabled(False)
-        self.render_highlight_btn.setText("⏳ Rendering...")
+        self.render_highlight_btn.setText("⏳ Rendering… 0%")
 
         # Store for the callback
         self._render_output_path = output_path
@@ -3258,45 +3344,103 @@ class SignalTimelineWindow(QMainWindow):
         import threading
 
         def render():
-            try:
-                filter_parts = []
-                inputs = []
+            from modules.app_paths import ffmpeg_exe
+            import tempfile
 
-                for i, (start, end) in enumerate(clips):
-                    duration = end - start
-                    inputs.extend(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", self.video_path])
-                    filter_parts.append(f"[{i}:v][{i}:a]")
+            def _parse_ffmpeg_time(ts):
+                # ffmpeg -progress emits out_time=HH:MM:SS.microseconds
+                try:
+                    h, m, s = ts.split(":")
+                    return int(h) * 3600 + int(m) * 60 + float(s)
+                except Exception:
+                    return None
 
-                n = len(clips)
-                filter_str = "".join(filter_parts) + f"concat=n={n}:v=1:a=1[outv][outa]"
+            total_dur = sum(e - s for s, e in clips) or 0.0
 
-                cmd = ["ffmpeg", "-y", "-hwaccel", "none"] + inputs + [
-                    "-filter_complex", filter_str,
-                    "-map", "[outv]", "-map", "[outa]",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                    "-c:a", "aac", "-b:a", "192k",
-                    output_path
-                ]
+            inputs = []
+            filter_parts = []
+            for i, (start, end) in enumerate(clips):
+                duration = end - start
+                inputs.extend(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+                               "-i", self.video_path])
+                filter_parts.append(f"[{i}:v][{i}:a]")
+            n = len(clips)
+            # Normalize to 8-bit yuv420p after concat: VR sources are often
+            # 10-bit HEVC, which several encoders (and 8-bit libx264 builds)
+            # reject with "pixel format unsupported".
+            filter_str = ("".join(filter_parts) +
+                          f"concat=n={n}:v=1:a=1[cv][outa];[cv]format=yuv420p[outv]")
 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            # Prefer a GPU encoder (huge win at VR resolutions); try each
+            # available one in turn and fall through to CPU libx264 last.
+            attempts = self._encoder_chain()
 
-                if result.returncode == 0 and os.path.exists(output_path):
-                    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                    total_dur = sum(e - s for s, e in clips)
-                    msg = (f"✅ Highlight video rendered!\n\n"
-                           f"File: {os.path.basename(output_path)}\n"
-                           f"Clips: {len(clips)}\n"
-                           f"Duration: {total_dur:.1f}s\n"
-                           f"Size: {size_mb:.1f} MB")
-                    self.render_finished.emit(True, msg)
-                else:
-                    err = result.stderr[-500:] if result.stderr else "Unknown error"
-                    self.render_finished.emit(False, f"FFmpeg error:\n{err}")
+            last_err = "Unknown error"
+            for enc, vargs in attempts:
+                cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-nostats",
+                       "-progress", "pipe:1"] + inputs + [
+                       "-filter_complex", filter_str,
+                       "-map", "[outv]", "-map", "[outa]"] + vargs + [
+                       "-c:a", "aac", "-b:a", "192k",
+                       output_path]
+                try:
+                    self.render_progress.emit(0)
+                    with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                                errors="replace") as errf:
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                stderr=errf, text=True)
+                        for line in proc.stdout:
+                            line = line.strip()
+                            if line.startswith("out_time="):
+                                secs = _parse_ffmpeg_time(line.split("=", 1)[1])
+                                if total_dur > 0 and secs is not None:
+                                    pct = int(min(99, max(0, secs / total_dur * 100)))
+                                    self.render_progress.emit(pct)
+                            elif line == "progress=end":
+                                self.render_progress.emit(100)
+                        proc.wait()
 
-            except Exception as e:
-                self.render_finished.emit(False, str(e))
+                        if proc.returncode == 0 and os.path.exists(output_path):
+                            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                            msg = (f"✅ Highlight video rendered!\n\n"
+                                   f"File: {os.path.basename(output_path)}\n"
+                                   f"Clips: {len(clips)}\n"
+                                   f"Duration: {total_dur:.1f}s\n"
+                                   f"Size: {size_mb:.1f} MB\n"
+                                   f"Encoder: {enc}")
+                            self.render_finished.emit(True, msg)
+                            return
+
+                        errf.seek(0)
+                        last_err = (errf.read() or "").strip()[-2000:] or "Unknown error"
+                        print(f"⚠️ Render with {enc} failed (rc={proc.returncode}); "
+                              + ("falling back to next encoder…"
+                                 if (enc, vargs) != attempts[-1] else "no fallback left"))
+                        print("   cmd: " + " ".join(str(c) for c in cmd))
+                        print("   ffmpeg stderr tail:\n" + last_err[-1200:])
+                except Exception as e:
+                    last_err = str(e)
+
+            self.render_finished.emit(False, f"FFmpeg error:\n{last_err}")
 
         threading.Thread(target=render, daemon=True).start()
+
+    def _encoder_chain(self):
+        """Video-encoder fallback chain for the render, delegated to the shared
+        modules.encoder_select helper (also used by the pipeline) so the codec
+        decision — GPU vendor via device_utils, HEVC-for-VR by resolution,
+        libx264 fallback — lives in one place. Cached per window."""
+        if hasattr(self, '_enc_chain'):
+            return self._enc_chain
+        from modules.encoder_select import encoder_chain
+        self._enc_chain = encoder_chain(self.video_path)
+        return self._enc_chain
+
+    @Slot(int)
+    def on_render_progress(self, pct):
+        """Live render progress (0–100) from the ffmpeg worker thread."""
+        self.render_highlight_btn.setText(f"⏳ Rendering… {pct}%")
+        self.statusBar().showMessage(f"🎬 Rendering highlight video… {pct}%")
 
     @Slot(bool, str)
     def on_render_finished(self, success, message):
