@@ -9,6 +9,22 @@ import sys
 from modules import debug_console
 debug_console.install()
 
+# Parse --conf / --help right after debug_console.install(): in the packaged
+# --windowed build, sys.stdout/sys.stderr are None until install() replaces
+# them, so anything printed before that point (argparse's --help output, or
+# a --conf error below) would raise on None.write() or be silently lost.
+from modules import cli_args as _cli_args_module
+from modules.app_paths import set_config_override as _set_config_override
+_cli_args = _cli_args_module.parse_args(sys.argv[1:])
+if _cli_args.conf is not None:
+    try:
+        with open(_cli_args.conf, "r"):
+            pass
+    except OSError as e:
+        print(f"❌ Cannot read --conf path '{_cli_args.conf}': {e}", file=sys.stderr)
+        sys.exit(1)
+    _set_config_override(_cli_args.conf)
+
 import cv2
 import json
 import subprocess
@@ -2926,9 +2942,15 @@ class VideoHighlighterGUI(QWidget):
                 "suppress_no_cache_warning": self.config_data.get("ui", {}).get("suppress_no_cache_warning", False),
             },
         }
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, sort_keys=False, allow_unicode=True)
-            
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, sort_keys=False, allow_unicode=True)
+        except OSError as e:
+            # Don't let an unwritable CONFIG_FILE (e.g. a read-only --conf path)
+            # raise out of here: closeEvent's caller must still reach
+            # event.accept()/_hard_exit(0) below.
+            print(f"❌ Could not save config to '{CONFIG_FILE}': {e}", file=sys.stderr)
+
     def closeEvent(self, event):
         self.save_config()
         event.accept()

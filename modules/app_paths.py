@@ -149,13 +149,30 @@ def composition_rules_path() -> str | None:
     return None
 
 
+_config_override: str | None = None
+
+
+def set_config_override(path: str) -> None:
+    """Force config_path() to return this exact path, bypassing the usual
+    user_data_dir()/bundled-seed resolution. Set once at startup from
+    --conf; the caller is responsible for validating the path exists and
+    is readable before calling this."""
+    global _config_override
+    _config_override = path
+
+
 def config_path(filename: str = "config.yaml") -> str:
     """Resolve a user-editable config file.
 
     When frozen, this lives next to the executable (so edits/saves persist) and is
     seeded from the bundled default on first run. From source it's just the file in
     the project root, so ``python main.py`` behaves exactly as before.
+
+    Returns the override path directly (ignoring ``filename``) when
+    set_config_override() has been called -- see --conf in modules/cli_args.py.
     """
+    if _config_override is not None:
+        return _config_override
     target = os.path.join(user_data_dir(), filename)
     if not os.path.exists(target):
         bundled = resource_path(filename)
