@@ -46,11 +46,15 @@ _backlog: deque = deque(maxlen=5000)  # recent raw chunks, preloaded into the wi
 _gui_sink = None      # bridge.chunk.emit while the log window exists
 _window = None        # singleton _LogWindow (created on first show, then reused)
 _checkboxes: list = []  # weakrefs to registered GUI checkboxes, kept in sync
+_is_child = False      # set once in install(); children only append, never rotate
+_analysis_counter = 0  # count of in-flight video analyses; rotation defers while > 0
+_current_log_date: Optional[str] = None  # date (YYYY-MM-DD) the current log was opened into
+_RETENTION_DAYS = 7
 
 
 def log_file_path() -> str:
-    from modules.app_paths import user_data_dir
-    return os.path.join(user_data_dir(), "debug.log")
+    from modules.app_paths import logs_dir
+    return os.path.join(logs_dir(), "debug.log")
 
 
 class _Tee(io.TextIOBase):
@@ -107,30 +111,124 @@ class _Tee(io.TextIOBase):
         return "utf-8"
 
 
+def mark_analysis_start() -> None:
+    """Signal that a video analysis has begun. Reentrant: nested/concurrent
+    calls (batch processing, or two callers running at once) each increment
+    the counter, so rotation stays deferred until every started analysis has
+    ended."""
+    global _analysis_counter
+    with _lock:
+        _analysis_counter += 1
+
+
+def mark_analysis_end() -> None:
+    """Signal that a video analysis has ended. When this was the last
+    outstanding analysis, checks (atomically, under the same lock) whether a
+    deferred rotation is now due."""
+    global _analysis_counter
+    with _lock:
+        _analysis_counter = max(0, _analysis_counter - 1)
+        if _analysis_counter == 0:
+            _maybe_rotate()
+
+
+def _prune_old_logs() -> None:
+    """Delete rotated logs older than the retention window. Best-effort."""
+    import glob
+    from datetime import datetime, timedelta
+
+    cutoff = datetime.now() - timedelta(days=_RETENTION_DAYS)
+    pattern = os.path.join(os.path.dirname(log_file_path()), "debug-*.log")
+    for p in glob.glob(pattern):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def _maybe_rotate() -> None:
+    """Rotate the current log to a dated file and prune expired ones, if a
+    day boundary has passed and it's safe to (no analysis in progress, not a
+    multiprocessing child). Must be called with _lock held.
+
+    If a handle is already open (mid-session rotation), closes it before
+    renaming — Windows raises PermissionError renaming a path with an open
+    write handle in the same process — then reopens a fresh handle and
+    re-arms faulthandler. If no handle is open yet (pre-open / launch case),
+    leaves _log_fh as None for the caller (install()) to open afterward,
+    matching the precondition the original per-launch swap relied on.
+
+    Never raises: a rotation failure is logged and swallowed so it can't
+    propagate out of run_highlighter()'s finally block and mask the
+    pipeline's real result or exception.
+    """
+    global _log_fh, _current_log_date
+    if _is_child or _analysis_counter > 0:
+        return
+    try:
+        path = log_file_path()
+        today = time.strftime("%Y-%m-%d")
+        if _current_log_date is None:
+            # First check this session: derive the log's last-known date from
+            # its own mtime (in-memory state doesn't survive a relaunch).
+            if os.path.exists(path):
+                _current_log_date = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(path)))
+            else:
+                _current_log_date = today
+        if _current_log_date == today:
+            return
+
+        had_open_handle = _log_fh is not None
+        if had_open_handle:
+            try:
+                _log_fh.close()
+            except Exception:
+                pass
+            _log_fh = None
+        if os.path.exists(path):
+            rotated_path = os.path.join(os.path.dirname(path), f"debug-{_current_log_date}.log")
+            os.replace(path, rotated_path)
+        if had_open_handle:
+            _log_fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+            try:
+                import faulthandler
+                faulthandler.enable(file=_log_fh)
+            except Exception:
+                pass
+        _current_log_date = today
+        _prune_old_logs()
+    except Exception as e:
+        try:
+            stderr = _orig_stderr or sys.__stderr__
+            if stderr is not None:
+                stderr.write(f"⚠️ [debug_console] log rotation failed: {e}\n")
+        except Exception:
+            pass
+
+
 def install() -> None:
     """Redirect stdout/stderr through the tee and arm the crash handlers.
     Idempotent; safe in multiprocessing children (they append, never rotate,
     so they can't clobber the parent's live log)."""
-    global _installed, _log_fh, _orig_stdout, _orig_stderr
+    global _installed, _log_fh, _orig_stdout, _orig_stderr, _is_child
     if _installed:
         return
     _installed = True
 
-    path = log_file_path()
     try:
         import multiprocessing
-        is_child = multiprocessing.parent_process() is not None
+        _is_child = multiprocessing.parent_process() is not None
     except Exception:
-        is_child = False
+        _is_child = False
+
+    path = log_file_path()
+    if not _is_child:
+        with _lock:
+            _maybe_rotate()
     try:
-        if not is_child:
-            # keep exactly one previous run for comparison
-            prev = path[:-4] + ".prev.log"
-            if os.path.exists(path):
-                if os.path.exists(prev):
-                    os.remove(prev)
-                os.replace(path, prev)
-        _log_fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        if _log_fh is None:
+            _log_fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
     except Exception:
         _log_fh = None  # read-only install dir etc. — tee still feeds the backlog
 
@@ -144,7 +242,7 @@ def install() -> None:
     if _log_fh is not None:
         banner = (
             f"\n===== VideoHighlighter session {time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(frozen={bool(getattr(sys, 'frozen', False))}, child={is_child}) =====\n"
+            f"(frozen={bool(getattr(sys, 'frozen', False))}, child={_is_child}) =====\n"
         )
         _log_fh.write(banner)
         try:
