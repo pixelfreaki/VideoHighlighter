@@ -1068,7 +1068,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     log("⚠️ YOLO-World loaded but no objects specified — nothing will be detected")
                 
                 # Move to GPU if available
-                from modules.device_utils import detect_best_device
                 devices = detect_best_device(log_fn=log)
                 if "cuda" in yolo_device:
                     yolo_model.to(yolo_device)
@@ -1079,7 +1078,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"✅ YOLO-World loaded on CPU")
             else:
                 # Standard YOLO11 (supports OpenVINO)
-                from modules.device_utils import detect_best_device, resolve_yolo_device
                 devices = detect_best_device(log_fn=log)
                 if devices.use_openvino_yolo:
                     yolo_model = YOLO(openvino_model_folder, task="detect")
@@ -1308,7 +1306,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     # Only enable R3D when CUDA is actually present. On Intel/CPU
                     # systems R3D can only run on CPU (slow), so we disable it and
                     # let OpenVINO use the Intel GPU (load_models AUTO → GPU).
-                    from modules.device_utils import detect_best_device
                     _dev = detect_best_device(log_fn=log)
                     if _dev.pytorch_device == "cuda":
                         enable_r3d = True
