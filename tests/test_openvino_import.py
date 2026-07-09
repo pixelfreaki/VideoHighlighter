@@ -69,3 +69,36 @@ def test_export_skipped_when_folder_already_exists(tmp_path):
     devices = _FakeDevices(use_openvino_yolo=True)
 
     assert should_export_yolo_to_openvino(devices, str(existing_folder)) is False
+
+
+def test_export_gate_call_site_uses_should_export_yolo_to_openvino():
+    """Regression guard for pipeline.py's actual call site (not just the
+    extracted predicate above). A full behavioral integration test isn't
+    practical here: reaching this code requires driving
+    _run_highlighter_impl's ~2000-line body (video trim, transcript, motion
+    detection, ...) with no callable seam before the YOLO setup block. This
+    source check still catches the two concrete regressions this covers:
+    the export gate reverting to a hand-rolled inline condition, or a
+    redundant detect_best_device() call being reintroduced in this block.
+    """
+    path = os.path.join(REPO_ROOT, "pipeline.py")
+    with open(path, "r", encoding="utf-8") as f:
+        source = f.read()
+
+    start = source.index("# Check OpenVINO devices")
+    end = source.index("# Load YOLO model")
+    block = source[start:end]
+
+    assert "if should_export_yolo_to_openvino(devices, openvino_model_folder):" in block, (
+        "Export gate no longer calls should_export_yolo_to_openvino() -- "
+        "confirm the extraction wasn't reverted to an inline condition."
+    )
+    # Match the call syntax specifically (not "detect_best_device(") so the
+    # explanatory comment mentioning detect_best_device() in prose doesn't
+    # inflate the count.
+    call_count = block.count("detect_best_device(log_fn=")
+    assert call_count == 1, (
+        f"Expected exactly one detect_best_device() call in the YOLO setup "
+        f"block, found {call_count} -- a redundant call may have been "
+        f"reintroduced."
+    )
