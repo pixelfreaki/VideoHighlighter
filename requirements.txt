@@ -1,4 +1,12 @@
 numpy
+# This installs the CPU-only build by default. If you have an NVIDIA GPU, install
+# the matching CUDA build instead (same torch version, GPU-enabled) -- pick the
+# cuXXX tag matching your driver/GPU from https://pytorch.org/get-started/locally/, e.g.:
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch torchvision --upgrade
+# A plain `pip install -r requirements.txt` after that will NOT revert this --
+# pip only reinstalls a package if its version changes, and the CUDA build
+# reports the same version as the CPU build (e.g. 2.12.1), just with a
+# different local tag ("+cu130" vs "+cpu") that pip's resolver doesn't compare.
 torch
 pyyaml
 opencv-python>=4.7  # FaceDetectorYN (YuNet) + FaceRecognizerSF (SFace) need >=4.5.4
