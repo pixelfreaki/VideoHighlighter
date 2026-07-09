@@ -13,11 +13,16 @@ instead of raising.
 
 import json
 import os
+import threading
 import time
 
-from modules.app_paths import logs_dir
+from modules.app_paths import logs_dir, LOGS_RETENTION_DAYS
 
-_RETENTION_DAYS = 7
+# Two run_highlighter() callers (e.g. a manual "analyze" run and a
+# download-then-process run) can call emit_summary() concurrently; without
+# this, one thread's append can be silently dropped by another thread's
+# prune-and-rewrite racing it.
+_lock = threading.RLock()
 
 
 def _summary_file_path() -> str:
@@ -59,13 +64,19 @@ def log_summary(summary: dict, log_fn=print) -> None:
 def append_summary(summary: dict, log_fn=print) -> None:
     """Append one run's summary to the local cross-run record, then prune
     entries older than the retention window so the file doesn't grow
-    unbounded."""
+    unbounded.
+
+    Locked: two run_highlighter() callers can invoke this concurrently, and
+    the prune step's read-filter-rewrite would otherwise be a lost-update
+    race against a concurrent append.
+    """
     try:
-        path = _summary_file_path()
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(summary) + "\n")
-        _prune_old_entries(path, log_fn=log_fn)
+        with _lock:
+            path = _summary_file_path()
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary) + "\n")
+            _prune_old_entries(path, log_fn=log_fn)
     except Exception as e:
         log_fn(f"⚠️ Failed to append performance summary: {e}")
 
@@ -75,7 +86,7 @@ def _prune_old_entries(path: str, log_fn=print) -> None:
     window. Best-effort: a malformed line is dropped rather than blocking
     the prune, and any failure here is logged and swallowed."""
     try:
-        cutoff = time.time() - (_RETENTION_DAYS * 86400)
+        cutoff = time.time() - (LOGS_RETENTION_DAYS * 86400)
         kept = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:

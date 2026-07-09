@@ -124,3 +124,37 @@ def test_prune_old_entries_drops_malformed_lines_without_raising(tmp_path):
     perf_summary._prune_old_entries(str(summary_path), log_fn=_no_op_log)  # must not raise
 
     assert summary_path.read_text(encoding="utf-8") == ""
+
+
+def test_concurrent_append_summary_does_not_lose_entries(tmp_path):
+    # Regression: two run_highlighter() callers can invoke emit_summary()
+    # concurrently. Without a lock, one thread's prune-and-rewrite can race
+    # another thread's append and silently drop it.
+    import threading
+    import time
+
+    summary_path = tmp_path / "perf_summary.jsonl"
+    errors = []
+
+    def worker(i):
+        try:
+            perf_summary.append_summary(
+                {"timestamp": time.time(), "video_path": f"video{i}.mp4", "stages": {}},
+                log_fn=_no_op_log,
+            )
+        except Exception as e:
+            errors.append(e)
+
+    # Patch once at the top level -- entering/exiting unittest.mock.patch
+    # concurrently per-thread on the same target is itself a race and would
+    # produce false failures unrelated to the lock behavior under test.
+    with patch.object(perf_summary, "_summary_file_path", return_value=str(summary_path)):
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert not errors
+    lines = summary_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 20

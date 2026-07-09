@@ -32,6 +32,9 @@ def user_data_dir() -> str:
     return _project_root()
 
 
+LOGS_RETENTION_DAYS = 7  # shared by modules/debug_console.py and modules/perf_summary.py
+
+
 def logs_dir() -> str:
     """Writable directory for rotated debug logs, creating it if missing."""
     path = os.path.join(user_data_dir(), "logs")

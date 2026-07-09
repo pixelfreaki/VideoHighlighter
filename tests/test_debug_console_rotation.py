@@ -18,9 +18,16 @@ from modules import debug_console
 
 
 @pytest.fixture(autouse=True)
-def _reset_debug_console_state():
+def _reset_debug_console_state(tmp_path):
     """debug_console holds module-level singleton state; reset it around
-    every test so tests don't leak into each other."""
+    every test so tests don't leak into each other.
+
+    Also guards log_file_path() to a per-test tmp_path for the duration of
+    every test in this file. Without this, any test that lets
+    _analysis_counter reach zero (e.g. via mark_analysis_end()) triggers a
+    real _maybe_rotate() call against the actual project's logs/debug.log —
+    confirmed to have happened (a real, non-empty logs/debug.log was found
+    on disk from prior test runs)."""
     saved = {
         "_installed": debug_console._installed,
         "_log_fh": debug_console._log_fh,
@@ -33,7 +40,9 @@ def _reset_debug_console_state():
     debug_console._is_child = False
     debug_console._analysis_counter = 0
     debug_console._current_log_date = None
-    yield
+    guard_path = str(tmp_path / "debug.log")
+    with patch.object(debug_console, "log_file_path", return_value=guard_path):
+        yield
     if debug_console._log_fh is not None:
         try:
             debug_console._log_fh.close()
@@ -80,6 +89,16 @@ def test_maybe_rotate_rotates_when_day_changed_and_idle(tmp_path):
     assert rotated.exists()
     assert rotated.read_text(encoding="utf-8") == "old content\n"
     assert not log_path.exists()
+
+
+def test_maybe_rotate_on_true_first_launch_no_file_exists_yet(tmp_path):
+    # The real first-run path: no log file exists at all yet.
+    log_path = tmp_path / "debug.log"
+
+    debug_console._maybe_rotate(str(log_path))  # must not raise
+
+    assert debug_console._current_log_date == date.today().isoformat()
+    assert not log_path.exists()  # _maybe_rotate only rotates/prunes, never creates
 
 
 def test_maybe_rotate_no_rotate_when_same_day(tmp_path):
@@ -178,6 +197,37 @@ def test_rotation_failure_is_logged_and_swallowed_not_raised(tmp_path):
 
     with patch("os.replace", side_effect=OSError("simulated locked file")):
         debug_console._maybe_rotate(str(log_path))  # must not raise
+
+
+def test_mark_analysis_end_swallows_log_file_path_failure():
+    # Regression: log_file_path() (which creates logs_dir()) is evaluated
+    # as _maybe_rotate's argument, outside its own try/except. A failure
+    # there must not escape mark_analysis_end(), since it's called from
+    # run_highlighter()'s finally block.
+    debug_console.mark_analysis_start()
+    with patch.object(debug_console, "log_file_path", side_effect=OSError("permission denied")):
+        debug_console.mark_analysis_end()  # must not raise
+
+    assert debug_console._analysis_counter == 0
+
+
+def test_install_swallows_log_file_path_failure_and_still_installs(tmp_path):
+    # Regression: install() must degrade gracefully (no file logging) rather
+    # than crash the app at startup when the log path can't be resolved.
+    import sys as real_sys
+    saved_stdout, saved_stderr = real_sys.stdout, real_sys.stderr
+    saved_hook = real_sys.excepthook
+    try:
+        with patch.object(debug_console, "log_file_path", side_effect=OSError("read-only install dir")):
+            debug_console.install()  # must not raise
+
+        assert debug_console._installed is True
+        assert debug_console._log_fh is None
+        # stdout/stderr are still teed (as _Tee instances) even without a file handle.
+        assert isinstance(real_sys.stdout, debug_console._Tee)
+    finally:
+        real_sys.stdout, real_sys.stderr = saved_stdout, saved_stderr
+        real_sys.excepthook = saved_hook
 
 
 def test_true_concurrent_start_end_never_leaves_counter_negative(tmp_path):

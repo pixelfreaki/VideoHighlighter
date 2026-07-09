@@ -49,7 +49,6 @@ _checkboxes: list = []  # weakrefs to registered GUI checkboxes, kept in sync
 _is_child = False      # set once in install(); children only append, never rotate
 _analysis_counter = 0  # count of in-flight video analyses; rotation defers while > 0
 _current_log_date: Optional[str] = None  # date (YYYY-MM-DD) the current log was opened into
-_RETENTION_DAYS = 7
 
 
 def log_file_path() -> str:
@@ -124,12 +123,21 @@ def mark_analysis_start() -> None:
 def mark_analysis_end() -> None:
     """Signal that a video analysis has ended. When this was the last
     outstanding analysis, checks (atomically, under the same lock) whether a
-    deferred rotation is now due."""
+    deferred rotation is now due.
+
+    Resolving the log path can itself raise (logs_dir() creates the
+    directory); that must never escape this function, since it's invoked
+    from inside run_highlighter()'s finally block and an unhandled exception
+    here would mask the pipeline's real result or exception."""
     global _analysis_counter
     with _lock:
         _analysis_counter = max(0, _analysis_counter - 1)
         if _analysis_counter == 0:
-            _maybe_rotate(log_file_path())
+            try:
+                path = log_file_path()
+            except Exception:
+                return
+            _maybe_rotate(path)
 
 
 def _prune_old_logs(dirpath: str) -> None:
@@ -137,7 +145,8 @@ def _prune_old_logs(dirpath: str) -> None:
     import glob
     from datetime import datetime, timedelta
 
-    cutoff = datetime.now() - timedelta(days=_RETENTION_DAYS)
+    from modules.app_paths import LOGS_RETENTION_DAYS
+    cutoff = datetime.now() - timedelta(days=LOGS_RETENTION_DAYS)
     pattern = os.path.join(dirpath, "debug-*.log")
     for p in glob.glob(pattern):
         try:
@@ -221,12 +230,19 @@ def install() -> None:
     except Exception:
         _is_child = False
 
-    path = log_file_path()
-    if not _is_child:
+    try:
+        path = log_file_path()
+    except Exception:
+        # e.g. a non-writable install location -- degrade like the
+        # existing "read-only install dir" fallback below: no file logging,
+        # but install() must not crash the app at startup over this.
+        path = None
+
+    if path is not None and not _is_child:
         with _lock:
             _maybe_rotate(path)
     try:
-        if _log_fh is None:
+        if path is not None and _log_fh is None:
             _log_fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
     except Exception:
         _log_fh = None  # read-only install dir etc. — tee still feeds the backlog
