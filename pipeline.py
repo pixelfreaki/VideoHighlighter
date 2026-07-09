@@ -348,7 +348,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     preview_fn=None):
     """
     Process single video or multiple videos for highlight generation.
-    
+
     Args:
         video_path: str for single video OR list of str for multiple videos
         sample_rate: Frame sampling rate
@@ -356,11 +356,29 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         log_fn: Logging function
         progress_fn: Progress callback function
         cancel_flag: Threading event for cancellation
-    
+
     Returns:
         str (single output path) or list of tuples [(input_path, output_path), ...]
+
+    Brackets the whole run with debug_console's analysis-in-progress counter
+    (reentrant: the batch branch below recursively calls this same wrapper
+    per video, so the counter stays above zero for the entire batch) so
+    debug-log rotation defers until every started analysis has finished.
     """
-    
+    from modules import debug_console
+    debug_console.mark_analysis_start()
+    try:
+        return _run_highlighter_impl(
+            video_path, sample_rate, gui_config, log_fn, progress_fn,
+            cancel_flag, preview_fn,
+        )
+    finally:
+        debug_console.mark_analysis_end()
+
+
+def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
+                    log_fn=print, progress_fn=None, cancel_flag=None,
+                    preview_fn=None):
     # ========== MULTI-FILE BATCH PROCESSING ==========
     if isinstance(video_path, (list, tuple)):
         results = []
