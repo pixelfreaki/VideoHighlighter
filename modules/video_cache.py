@@ -326,12 +326,23 @@ class VideoAnalysisCache:
                 return self._get_analysis_cache_path_for_signature(video_path, signature).exists()
             return self._get_cache_path(video_path).exists()
 
-    def save(self, video_path: str, analysis_data: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> None:
+    def save(
+        self,
+        video_path: str,
+        analysis_data: Dict[str, Any],
+        params: Optional[Dict[str, Any]] = None,
+        complete: bool = True,
+        completed_stages: Optional[List[str]] = None,
+    ) -> None:
         """
         Save analysis cache.
         - Atomic write (no partial cache)
         - If params provided: use signature-based filename so parameter changes create a new cache file
         - If params is None: fall back to legacy path (<video_hash>.cache.json) for backward compatibility
+        - complete=False marks this as an in-progress checkpoint (cache_complete: False) rather than
+          a fully-usable analysis cache; load() continues to reject these, load_partial() accepts them
+        - completed_stages: names of pipeline stages whose results are present in analysis_data so far;
+          only meaningful when complete=False (defaults preserve today's behavior for existing callers)
         """
         with self._lock:
             video_hash = self._get_video_hash(video_path)
@@ -348,11 +359,13 @@ class VideoAnalysisCache:
                 "video_hash": video_hash,
                 "cached_at": datetime.now().isoformat(),
                 "cache_version": "1.1",
-                "cache_complete": True,
+                "cache_complete": complete,
                 "analysis_signature": signature,
                 "analysis_parameters": params,
                 **analysis_data,
             }
+            if completed_stages is not None:
+                cache_data["completed_stages"] = list(completed_stages)
 
             atomic_write_json(cache_path, cache_data)
 
@@ -364,6 +377,7 @@ class VideoAnalysisCache:
         Load analysis cache.
         - If params provided: load signature-based cache (new cache per parameter change)
         - If params is None: fall back to legacy cache path
+        - Rejects incomplete (cache_complete is not True) caches -- use load_partial() for resume detection
         """
         with self._lock:
             if params is not None:
@@ -404,6 +418,42 @@ class VideoAnalysisCache:
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"⚠ Cache file corrupted: {e}, will re-process")
                 self.stats["misses"] += 1
+                return None
+
+    def load_partial(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Load analysis cache for resume detection, regardless of completeness.
+
+        Mirrors load()'s hash/signature identity checks but skips the cache_complete
+        rejection, so an in-progress checkpoint (saved via save(complete=False, ...))
+        is returned too -- with whatever completed_stages and partial data is on disk.
+        Returns None on a hash/signature mismatch or missing/corrupt file.
+        """
+        with self._lock:
+            if params is not None:
+                signature = self._make_signature(params)
+                cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
+            else:
+                signature = None
+                cache_path = self._get_cache_path(video_path)
+
+            if not cache_path.exists():
+                return None
+
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+
+                current_hash = self._get_video_hash(video_path)
+                if cache_data.get("video_hash") != current_hash:
+                    return None
+
+                if params is not None and cache_data.get("analysis_signature") != signature:
+                    return None
+
+                return cache_data
+
+            except (json.JSONDecodeError, KeyError):
                 return None
 
     # convenience aliases (optional usage in your pipeline)
