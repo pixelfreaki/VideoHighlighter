@@ -129,16 +129,16 @@ def mark_analysis_end() -> None:
     with _lock:
         _analysis_counter = max(0, _analysis_counter - 1)
         if _analysis_counter == 0:
-            _maybe_rotate()
+            _maybe_rotate(log_file_path())
 
 
-def _prune_old_logs() -> None:
+def _prune_old_logs(dirpath: str) -> None:
     """Delete rotated logs older than the retention window. Best-effort."""
     import glob
     from datetime import datetime, timedelta
 
     cutoff = datetime.now() - timedelta(days=_RETENTION_DAYS)
-    pattern = os.path.join(os.path.dirname(log_file_path()), "debug-*.log")
+    pattern = os.path.join(dirpath, "debug-*.log")
     for p in glob.glob(pattern):
         try:
             if datetime.fromtimestamp(os.path.getmtime(p)) < cutoff:
@@ -147,7 +147,7 @@ def _prune_old_logs() -> None:
             pass
 
 
-def _maybe_rotate() -> None:
+def _maybe_rotate(path: str) -> None:
     """Rotate the current log to a dated file and prune expired ones, if a
     day boundary has passed and it's safe to (no analysis in progress, not a
     multiprocessing child). Must be called with _lock held.
@@ -167,7 +167,6 @@ def _maybe_rotate() -> None:
     if _is_child or _analysis_counter > 0:
         return
     try:
-        path = log_file_path()
         today = time.strftime("%Y-%m-%d")
         if _current_log_date is None:
             # First check this session: derive the log's last-known date from
@@ -197,7 +196,7 @@ def _maybe_rotate() -> None:
             except Exception:
                 pass
         _current_log_date = today
-        _prune_old_logs()
+        _prune_old_logs(os.path.dirname(path))
     except Exception as e:
         try:
             stderr = _orig_stderr or sys.__stderr__
@@ -225,7 +224,7 @@ def install() -> None:
     path = log_file_path()
     if not _is_child:
         with _lock:
-            _maybe_rotate()
+            _maybe_rotate(path)
     try:
         if _log_fh is None:
             _log_fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)

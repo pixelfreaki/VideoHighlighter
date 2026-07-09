@@ -73,8 +73,7 @@ def test_maybe_rotate_rotates_when_day_changed_and_idle(tmp_path):
     old_time = time.time() - 86400
     os.utime(str(log_path), (old_time, old_time))
 
-    with patch.object(debug_console, "log_file_path", return_value=str(log_path)):
-        debug_console._maybe_rotate()
+    debug_console._maybe_rotate(str(log_path))
 
     assert debug_console._current_log_date == date.today().isoformat()
     rotated = tmp_path / f"debug-{yesterday}.log"
@@ -88,8 +87,7 @@ def test_maybe_rotate_no_rotate_when_same_day(tmp_path):
     log_path.write_text("today's content\n", encoding="utf-8")
     # mtime defaults to "now" -> today
 
-    with patch.object(debug_console, "log_file_path", return_value=str(log_path)):
-        debug_console._maybe_rotate()
+    debug_console._maybe_rotate(str(log_path))
 
     assert log_path.exists()
     assert log_path.read_text(encoding="utf-8") == "today's content\n"
@@ -102,8 +100,7 @@ def test_maybe_rotate_deferred_while_analysis_in_progress(tmp_path):
     os.utime(str(log_path), (old_time, old_time))
     debug_console._analysis_counter = 1
 
-    with patch.object(debug_console, "log_file_path", return_value=str(log_path)):
-        debug_console._maybe_rotate()
+    debug_console._maybe_rotate(str(log_path))
 
     # Still there, untouched -- rotation was deferred.
     assert log_path.exists()
@@ -117,8 +114,7 @@ def test_maybe_rotate_skipped_for_multiprocessing_child(tmp_path):
     os.utime(str(log_path), (old_time, old_time))
     debug_console._is_child = True
 
-    with patch.object(debug_console, "log_file_path", return_value=str(log_path)):
-        debug_console._maybe_rotate()
+    debug_console._maybe_rotate(str(log_path))
 
     assert log_path.exists()
     assert debug_console._current_log_date is None
@@ -135,8 +131,7 @@ def test_prune_deletes_files_older_than_retention_window_keeps_recent(tmp_path):
     os.utime(str(old_file), (old_time, old_time))
     os.utime(str(recent_file), (recent_time, recent_time))
 
-    with patch.object(debug_console, "log_file_path", return_value=str(tmp_path / "debug.log")):
-        debug_console._prune_old_logs()
+    debug_console._prune_old_logs(str(tmp_path))
 
     assert not old_file.exists()
     assert recent_file.exists()
@@ -160,8 +155,7 @@ def test_mid_session_rotation_closes_and_reopens_handle_without_permission_error
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     debug_console._current_log_date = yesterday
 
-    with patch.object(debug_console, "log_file_path", return_value=str(log_path)):
-        debug_console._maybe_rotate()  # must not raise
+    debug_console._maybe_rotate(str(log_path))  # must not raise
 
     assert debug_console._current_log_date == date.today().isoformat()
     assert debug_console._log_fh is not None
@@ -182,9 +176,8 @@ def test_rotation_failure_is_logged_and_swallowed_not_raised(tmp_path):
     old_time = time.time() - 86400
     os.utime(str(log_path), (old_time, old_time))
 
-    with patch.object(debug_console, "log_file_path", return_value=str(log_path)), \
-         patch("os.replace", side_effect=OSError("simulated locked file")):
-        debug_console._maybe_rotate()  # must not raise
+    with patch("os.replace", side_effect=OSError("simulated locked file")):
+        debug_console._maybe_rotate(str(log_path))  # must not raise
 
 
 def test_true_concurrent_start_end_never_leaves_counter_negative(tmp_path):

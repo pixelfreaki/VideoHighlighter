@@ -78,7 +78,8 @@ def test_recursive_batch_style_calls_keep_counter_above_zero_until_all_finish():
     # plan) recursively calls the public run_highlighter() wrapper once per
     # video (pipeline.py:410). Simulate that recursion pattern directly
     # against the wrapper, without needing the real batch/config machinery,
-    # to prove the counter nests correctly (KTD1).
+    # to prove a boolean flag would be wrong here: it would clear on the
+    # first video's completion while the outer batch call is still running.
     import pipeline
     from modules import debug_console
 
