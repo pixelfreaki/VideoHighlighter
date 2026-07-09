@@ -5,7 +5,7 @@ import random
 import whisper
 import cv2
 from typing import List, Dict, Optional
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 
 # --------------------------
 # VIDEO & TIMESTAMP UTILITIES
@@ -438,15 +438,14 @@ def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
 
     return results
 
-def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
+def safe_translate(translator, text, retries=3, delay=1.0):
     """
-    Try translating with googletrans with retries and exponential backoff.
+    Try translating with deep-translator with retries and exponential backoff.
     Falls back to original text if all retries fail.
     """
     for attempt in range(retries):
         try:
-            result = translator.translate(text, src=src, dest=dest)
-            return result.text
+            return translator.translate(text)
         except Exception as e:
             print(f"⚠️ Translation failed (attempt {attempt+1}/{retries}): {e}")
             if attempt < retries - 1:
@@ -459,7 +458,7 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
     """
     Translate subtitle segments.
     Strategy: try local LLM (llama via ollama) first for better quality,
-    fall back to googletrans if LLM is unavailable.
+    fall back to deep-translator if LLM is unavailable.
     """
     if not segments:
         print("No segments to translate")
@@ -505,18 +504,18 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
         else:
             print(f"⚠️ LLM returned {len(translated_texts)} translations for {len(segments)} segments, falling back")
 
-    # --- Fallback: googletrans ---
+    # --- Fallback: deep-translator (Google backend) ---
     try:
-        translator = Translator()
-        print("🌐 Using googletrans for translation (LLM not available)")
+        translator = GoogleTranslator(source=source_lang, target=target_lang)
+        print("🌐 Using deep-translator for translation (LLM not available)")
     except Exception as e:
         print(f"❌ No translation backend available: {e}")
-        print("   Install ollama + llama3 for better translations, or pip install googletrans==4.0.0-rc1")
+        print("   Install ollama + llama3 for better translations, or pip install deep-translator")
         return segments
 
     translated_segments = []
     for i, seg in enumerate(segments):
-        translated_text = safe_translate(translator, seg["text"], src=source_lang, dest=target_lang)
+        translated_text = safe_translate(translator, seg["text"])
         new_seg = {
             'start': seg['start'],
             'end': seg['end'],
@@ -528,7 +527,7 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
         translated_segments.append(new_seg)
         print(f"  Translated {i+1}/{len(segments)}", end='\r')
 
-    print(f"\n✅ Translated {len(translated_segments)} segments via googletrans")
+    print(f"\n✅ Translated {len(translated_segments)} segments via deep-translator")
     return translated_segments
 
 # --------------------------
