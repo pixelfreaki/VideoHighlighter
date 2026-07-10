@@ -15,3 +15,4 @@ yolo11*.pt
 yolo11*_openvino_model
 yolov8*-worldv2.pt
 config/*
+object_log.csv
