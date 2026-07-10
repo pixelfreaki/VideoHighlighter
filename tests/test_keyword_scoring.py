@@ -13,6 +13,7 @@ from __future__ import annotations
 from modules.keyword_scoring import (
     normalize_text,
     validate_advanced_scoring_config,
+    validate_advanced_scoring_config_structured,
     match_keywords_advanced,
     match_keywords_simple,
     resolve_keyword_scoring,
@@ -273,6 +274,123 @@ def test_validate_rejects_missing_group_id():
     config = {"groups": [{"weight": 1, "words": ["x"]}]}
     errors = validate_advanced_scoring_config(config)
     assert any("has no id" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# validate_advanced_scoring_config_structured (U1 of the GUI plan, R7):
+# field-addressable errors the GUI can pin to group cards. Each entry carries
+# group_index (None for config-level errors), field, and the exact message
+# string the plain validator produces.
+# ---------------------------------------------------------------------------
+
+def test_validate_structured_valid_two_group_config_is_empty():
+    config = _two_group_config()
+    assert validate_advanced_scoring_config_structured(config) == []
+    assert validate_advanced_scoring_config(config) == []
+
+
+def test_validate_structured_blank_id_pins_group_index_and_id_field():
+    config = {"groups": [
+        {"id": "a", "weight": 1, "words": ["x"]},
+        {"id": "   ", "weight": 2, "words": ["y"]},
+    ]}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] == 1
+    assert entries[0]["field"] == "id"
+
+
+def test_validate_structured_negative_weight_pins_weight_field():
+    config = {"groups": [
+        {"id": "a", "weight": 1, "words": ["x"]},
+        {"id": "b", "weight": -1, "words": ["y"]},
+    ]}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] == 1
+    assert entries[0]["field"] == "weight"
+
+
+def test_validate_structured_non_numeric_weight_pins_weight_field():
+    config = {"groups": [{"id": "a", "weight": "heavy", "words": ["x"]}]}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] == 0
+    assert entries[0]["field"] == "weight"
+
+
+def test_validate_structured_enabled_group_without_words_pins_words_field():
+    config = {"groups": [{"id": "a", "weight": 1, "words": [], "enabled": True}]}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] == 0
+    assert entries[0]["field"] == "words"
+
+
+def test_validate_structured_duplicate_keyword_within_group_pins_words_field():
+    config = {"groups": [{"id": "a", "weight": 1, "words": ["morri", "Morri"]}]}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] == 0
+    assert entries[0]["field"] == "words"
+
+
+def test_validate_structured_duplicate_keyword_across_groups_pins_later_group():
+    config = {"groups": [
+        {"id": "danger", "weight": 1, "words": ["morri"]},
+        {"id": "panic", "weight": 2, "words": ["Morri"]},
+    ]}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] == 1  # the group where the duplicate was encountered
+    assert entries[0]["field"] == "words"
+
+
+def test_validate_structured_non_list_groups_is_config_level():
+    entries = validate_advanced_scoring_config_structured({"groups": "my_group"})
+    assert len(entries) == 1
+    assert entries[0]["group_index"] is None
+    assert entries[0]["field"] == "groups"
+
+
+def test_validate_structured_non_numeric_cooldown_seconds_is_config_level():
+    config = {"groups": [{"id": "a", "weight": 1, "words": ["x"]}],
+              "cooldown_seconds": "oops"}
+    entries = validate_advanced_scoring_config_structured(config)
+    assert len(entries) == 1
+    assert entries[0]["group_index"] is None
+    assert entries[0]["field"] == "cooldown_seconds"
+
+
+def test_validate_structured_string_api_parity_on_invalid_fixtures():
+    # The plain validator must be exactly the structured messages, in order --
+    # pipeline.py logs those strings and existing tests assert on them.
+    invalid_fixtures = [
+        {"groups": [{"id": "a", "weight": 1, "words": ["x"]},
+                    {"id": "   ", "weight": 2, "words": ["y"]}]},
+        {"groups": [{"id": "a", "weight": -1, "words": ["x"]}]},
+        {"groups": [{"id": "a", "weight": "heavy", "words": ["x"]}]},
+        {"groups": [{"id": "a", "weight": 1, "words": [], "enabled": True}]},
+        {"groups": [{"id": "a", "weight": 1, "words": ["morri", "Morri"]}]},
+        {"groups": [{"id": "danger", "weight": 1, "words": ["morri"]},
+                    {"id": "panic", "weight": 2, "words": ["Morri"]}]},
+        {"groups": "my_group"},
+        {"groups": [{"id": "a", "weight": 1, "words": ["x"]}], "cooldown_seconds": "oops"},
+        {"groups": []},
+        {"groups": [{"id": "a", "weight": 1, "words": ["x"]},
+                    {"id": "a", "weight": 2, "words": ["y"]}]},
+        {"groups": [{"id": "a", "weight": 1, "words": "chef"}]},
+        {"groups": ["not a mapping"]},
+    ]
+    for config in invalid_fixtures:
+        structured = validate_advanced_scoring_config_structured(config)
+        assert structured, f"fixture expected to be invalid: {config!r}"
+        assert validate_advanced_scoring_config(config) == [e["message"] for e in structured]
+
+
+def test_validate_structured_extra_label_key_is_not_an_error():
+    config = {"groups": [{"id": "a", "weight": 1, "words": ["x"], "label": "Reaction"}]}
+    assert validate_advanced_scoring_config_structured(config) == []
 
 
 # ---------------------------------------------------------------------------

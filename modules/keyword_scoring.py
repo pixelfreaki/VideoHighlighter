@@ -60,58 +60,71 @@ def normalize_text(
     return result
 
 
-def validate_advanced_scoring_config(advanced_scoring: Dict[str, Any]) -> List[str]:
-    """Validate an *enabled* advanced_scoring config. Returns error strings; empty means valid.
+def validate_advanced_scoring_config_structured(
+    advanced_scoring: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Validate an *enabled* advanced_scoring config into field-addressable errors (R7).
 
-    Only called when keywords.advanced_scoring.enabled is true (KTD4) -- an invalid
-    but disabled config is never validated and never blocks simple mode (R14).
+    Each entry is {"group_index": int | None, "field": str, "message": str} so the
+    GUI can pin errors to the offending group card; group_index is None for
+    config-level errors (non-list groups, bad cooldown_seconds) and field is one
+    of "id", "weight", "words", "groups", "cooldown_seconds". For a duplicate
+    normalized keyword across groups, group_index is the group where the
+    duplicate was encountered (the later group). The message strings are the
+    single source for validate_advanced_scoring_config(), so the two APIs can
+    never disagree.
     """
-    errors: List[str] = []
+    errors: List[Dict[str, Any]] = []
+
+    def _error(group_index: Optional[int], field: str, message: str) -> None:
+        errors.append({"group_index": group_index, "field": field, "message": message})
+
     groups = advanced_scoring.get("groups") or []
 
     if not isinstance(groups, list):
-        errors.append(f"advanced_scoring.groups must be a list (got {type(groups).__name__})")
+        _error(None, "groups", f"advanced_scoring.groups must be a list (got {type(groups).__name__})")
         return errors
 
     if not groups:
-        errors.append("advanced_scoring.enabled is true but no groups are configured")
+        _error(None, "groups", "advanced_scoring.enabled is true but no groups are configured")
         return errors
 
     cooldown_seconds = advanced_scoring.get("cooldown_seconds", 5)
     try:
         float(cooldown_seconds)
     except (TypeError, ValueError):
-        errors.append(f"advanced_scoring.cooldown_seconds must be numeric (got {cooldown_seconds!r})")
+        _error(None, "cooldown_seconds",
+               f"advanced_scoring.cooldown_seconds must be numeric (got {cooldown_seconds!r})")
 
     seen_ids = set()
     seen_keywords_global: Dict[str, str] = {}  # normalized keyword -> owning group label
 
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
-            errors.append(f"group at index {i} must be a mapping (got {type(group).__name__})")
+            _error(i, "groups", f"group at index {i} must be a mapping (got {type(group).__name__})")
             continue
 
         group_id = str(group.get("id") or "").strip()
         label = group_id or f"<group at index {i}>"
 
         if not group_id:
-            errors.append(f"group at index {i} has no id")
+            _error(i, "id", f"group at index {i} has no id")
         elif group_id in seen_ids:
-            errors.append(f"duplicate group id '{group_id}'")
+            _error(i, "id", f"duplicate group id '{group_id}'")
         else:
             seen_ids.add(group_id)
 
         weight = group.get("weight")
         try:
             if float(weight) < 0:
-                errors.append(f"group '{label}' has a negative weight ({weight})")
+                _error(i, "weight", f"group '{label}' has a negative weight ({weight})")
         except (TypeError, ValueError):
-            errors.append(f"group '{label}' has a non-numeric weight ({weight!r})")
+            _error(i, "weight", f"group '{label}' has a non-numeric weight ({weight!r})")
 
         enabled = group.get("enabled", True)
         raw_words = group.get("words") or []
         if not isinstance(raw_words, list):
-            errors.append(f"group '{label}' has words that must be a list (got {type(raw_words).__name__})")
+            _error(i, "words", f"group '{label}' has words that must be a list (got {type(raw_words).__name__})")
             continue
         words = [str(w).strip() for w in raw_words if str(w).strip()]
 
@@ -119,7 +132,7 @@ def validate_advanced_scoring_config(advanced_scoring: Dict[str, Any]) -> List[s
         # a disabled group is preserved but never matched (R5), so an empty word
         # list on a disabled group is not an error.
         if enabled and not words:
-            errors.append(f"enabled group '{label}' has no non-blank keywords")
+            _error(i, "words", f"enabled group '{label}' has no non-blank keywords")
 
         # Duplicate-normalized-keyword checks apply regardless of enabled state --
         # this is a static config-consistency check, not a runtime-matching one.
@@ -129,18 +142,28 @@ def validate_advanced_scoring_config(advanced_scoring: Dict[str, Any]) -> List[s
             if not norm:
                 continue
             if norm in seen_in_group:
-                errors.append(f"duplicate normalized keyword '{norm}' within group '{label}'")
+                _error(i, "words", f"duplicate normalized keyword '{norm}' within group '{label}'")
                 continue
             seen_in_group.add(norm)
             if norm in seen_keywords_global:
-                errors.append(
-                    f"duplicate normalized keyword '{norm}' in groups "
-                    f"'{seen_keywords_global[norm]}' and '{label}'"
-                )
+                _error(i, "words",
+                       f"duplicate normalized keyword '{norm}' in groups "
+                       f"'{seen_keywords_global[norm]}' and '{label}'")
             else:
                 seen_keywords_global[norm] = label
 
     return errors
+
+
+def validate_advanced_scoring_config(advanced_scoring: Dict[str, Any]) -> List[str]:
+    """Validate an *enabled* advanced_scoring config. Returns error strings; empty means valid.
+
+    Only called when keywords.advanced_scoring.enabled is true (KTD4) -- an invalid
+    but disabled config is never validated and never blocks simple mode (R14).
+    Thin wrapper over validate_advanced_scoring_config_structured() so the
+    strings pipeline.py logs stay byte-identical to the structured messages.
+    """
+    return [e["message"] for e in validate_advanced_scoring_config_structured(advanced_scoring)]
 
 
 def _spans_overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
