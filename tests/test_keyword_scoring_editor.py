@@ -14,7 +14,6 @@ from modules.keyword_scoring_editor import (
     serialize_section,
     import_simple_keywords,
     new_group,
-    reorder_group,
     reset_section,
     should_persist,
     resolve_section_for_save,
@@ -222,28 +221,17 @@ def test_new_group_is_born_disabled_with_empty_words():
 
 
 # ---------------------------------------------------------------------------
-# reorder_group (R4)
+# group order (R4): order is model order, reflected verbatim in serialization
 # ---------------------------------------------------------------------------
 
-def test_reorder_group_moves_a_group_preserving_all_entries():
+def test_group_order_is_reflected_in_serialization():
     model, _ = parse_section(_config(_well_formed_section()))
-    model["groups"].append({"id": "third", "weight": 1, "enabled": False, "words": []})
-
-    reordered = reorder_group(model, 0, 2)
-
-    assert [g["id"] for g in reordered["groups"]] == ["panic", "third", "reaction"]
-    # nothing lost, nothing mutated beyond order
-    assert sorted(g["id"] for g in reordered["groups"]) == ["panic", "reaction", "third"]
-    moved = [g for g in reordered["groups"] if g["id"] == "reaction"][0]
-    assert moved["label"] == "Reação"
-    assert moved["future_key"] == {"nested": [1, 2]}
-
-
-def test_reorder_group_is_reflected_in_serialization():
-    model, _ = parse_section(_config(_well_formed_section()))
-    reordered = reorder_group(model, 1, 0)
-    serialized = serialize_section(reordered)
+    model["groups"].reverse()  # the panel reorders the model list in place
+    serialized = serialize_section(model)
     assert [g["id"] for g in serialized["groups"]] == ["panic", "reaction"]
+    kept = [g for g in serialized["groups"] if g["id"] == "reaction"][0]
+    assert kept["label"] == "Reação"
+    assert kept["future_key"] == {"nested": [1, 2]}
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +373,15 @@ def test_resolve_toggle_off_invalid_wip_model_is_written():
 
     assert resolved["enabled"] is False
     assert [g["id"] for g in resolved["groups"]] == ["danger", "panic"]
+
+
+def test_resolve_precomputed_gate_verdict_skips_revalidation():
+    # The panel caches a gate verdict per committed edit; passing it avoids a
+    # redundant full validation. False → on-disk fallback without validating;
+    # True with a valid model → serialized model.
+    on_disk = _well_formed_section()
+    config_data = _config(on_disk)
+    valid_model, _ = parse_section(config_data)
+
+    assert resolve_section_for_save(valid_model, [], config_data, gate_ok=False) == on_disk
+    assert resolve_section_for_save(valid_model, [], config_data, gate_ok=True) == on_disk

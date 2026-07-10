@@ -46,6 +46,21 @@ DELETE_CONFIRM_TIMEOUT_MS = 3000
 
 _ERROR_STYLE = "color: #c33; font-size: 10px;"  # main.py:1668 precedent
 
+def _spin_value_if_changed(spin, current_raw):
+    """The shared numeric-commit step: the spin's value normalized (integral
+    values stay ints for clean YAML), or None when it matches the currently
+    stored value so no-op commits are skipped. An unparseable stored value
+    always commits."""
+    value = spin.value()
+    if value == int(value):
+        value = int(value)
+    try:
+        current = float(current_raw)
+    except (TypeError, ValueError):
+        return value
+    return None if float(value) == current else value
+
+
 _NORMALIZATION_LABELS = (
     ("lowercase", "Lowercase"),
     ("remove_accents", "Remove accents"),
@@ -301,14 +316,8 @@ class _GroupCard(QFrame):
         self.changed.emit()
 
     def _commit_weight(self):
-        value = self.weight_spin.value()
-        if value == int(value):
-            value = int(value)  # keep integral weights integral in YAML
-        try:
-            current = float(self._group.get("weight", 0))
-        except (TypeError, ValueError):
-            current = None
-        if current is not None and float(value) == current:
+        value = _spin_value_if_changed(self.weight_spin, self._group.get("weight", 0))
+        if value is None:
             return
         self._group["weight"] = value
         self.changed.emit()
@@ -484,6 +493,14 @@ class AdvancedScoringPanel(QWidget):
 
     def has_parse_error(self) -> bool:
         return bool(self._coercion_flags)
+
+    def is_enabled(self) -> bool:
+        """Whether advanced scoring is the active matcher (the master toggle)."""
+        return bool(self._model.get("enabled", False))
+
+    def coercion_flags(self) -> List[str]:
+        """The real parse-coercion flags, for resolve_section_for_save's contract."""
+        return list(self._coercion_flags)
 
     def add_group(self, group_dict: Dict[str, Any]):
         """Append a group (e.g. the U6 import result) and run the commit flow."""
@@ -700,14 +717,8 @@ class AdvancedScoringPanel(QWidget):
     # -- global knob commits -------------------------------------------------------
 
     def _commit_cooldown(self):
-        value = self.cooldown_spin.value()
-        if value == int(value):
-            value = int(value)
-        try:
-            current = float(self._model.get("cooldown_seconds", 5))
-        except (TypeError, ValueError):
-            current = None
-        if current is not None and float(value) == current:
+        value = _spin_value_if_changed(self.cooldown_spin, self._model.get("cooldown_seconds", 5))
+        if value is None:
             return
         self._model["cooldown_seconds"] = value
         self._commit()

@@ -1365,6 +1365,12 @@ class VideoHighlighterGUI(QWidget):
         adv_model, adv_flags = parse_section(self.config_data)
         self.advanced_scoring_panel = AdvancedScoringPanel(adv_model, adv_flags)
         transcript_form.addRow(self.advanced_scoring_panel)
+        # Debounced write-through (KTD2): save_config() rewrites the whole
+        # file, so rapid panel edits coalesce; run_pipeline() flushes.
+        self._adv_save_timer = QTimer(self)
+        self._adv_save_timer.setSingleShot(True)
+        self._adv_save_timer.setInterval(400)
+        self._adv_save_timer.timeout.connect(self.save_config)
         self.advanced_scoring_panel.master_toggled.connect(self.on_advanced_scoring_toggle)
         self.advanced_scoring_panel.section_changed.connect(self.on_advanced_scoring_changed)
         self.advanced_scoring_panel.import_requested.connect(self.on_import_simple_keywords)
@@ -2897,11 +2903,12 @@ class VideoHighlighterGUI(QWidget):
         if panel is not None:
             advanced_scoring = resolve_section_for_save(
                 panel.current_model(),
-                ["unparsed section"] if panel.has_parse_error() else None,
+                panel.coercion_flags(),
                 self.config_data,
+                gate_ok=panel.is_gate_ok(),
             )
             if (not panel.has_parse_error()
-                    and bool(panel.current_model().get("enabled", False))
+                    and panel.is_enabled()
                     and not panel.is_gate_ok()):
                 # KTD3: enabled-and-invalid never blocks a save (or close) —
                 # but say that the last-valid on-disk section was kept.
@@ -3028,9 +3035,7 @@ class VideoHighlighterGUI(QWidget):
         """Handle transcript checkbox toggle"""
         self.transcript_source_lang.setEnabled(checked)
         self.transcript_model_combo.setEnabled(checked)
-        # R6: the simple list stays greyed while advanced scoring owns matching
-        advanced_on = bool(self.advanced_scoring_panel.current_model().get("enabled", False))
-        self.search_keywords_input.setEnabled(checked and not advanced_on)
+        self._sync_search_keywords_enabled()
         self.subtitles_checkbox.setEnabled(checked)
         
         # If transcript is disabled, also disable subtitles
@@ -3047,25 +3052,35 @@ class VideoHighlighterGUI(QWidget):
         self.subtitle_source_lang.setEnabled(final_state)
         self.subtitle_target_lang.setEnabled(final_state)
 
-    def on_advanced_scoring_toggle(self, checked):
-        """Handle advanced-scoring master toggle (R6): while advanced owns
-        matching, grey out the simple search-keywords field and show the note."""
-        transcript_enabled = self.transcript_checkbox.isChecked()
-        self.search_keywords_input.setEnabled(transcript_enabled and not checked)
-        self.simple_keywords_note.setVisible(bool(checked))
+    def _sync_search_keywords_enabled(self):
+        """R6: the simple list is editable only while transcript is on and
+        advanced scoring is not the active matcher; the note shows while it is."""
+        advanced_on = self.advanced_scoring_panel.is_enabled()
+        self.search_keywords_input.setEnabled(
+            self.transcript_checkbox.isChecked() and not advanced_on
+        )
+        self.simple_keywords_note.setVisible(advanced_on)
+
+    def on_advanced_scoring_toggle(self, _checked):
+        """Handle advanced-scoring master toggle (R6)."""
+        self._sync_search_keywords_enabled()
 
     def on_advanced_scoring_changed(self, section, gate_ok):
         """Write-through persistence for keywords.advanced_scoring (R8).
 
         Every committed panel edit lands here: if the persist gate passes
         (toggle off, or enabled and valid), mirror the section into
-        config_data and write config.yaml immediately; if blocked, leave
-        memory and disk untouched — the panel already renders the errors."""
+        config_data and schedule the config.yaml write; if blocked, leave
+        memory and disk untouched — the panel already renders the errors.
+        The write is debounced: save_config() rebuilds and rewrites the whole
+        file, so rapid chip edits coalesce into one write. Run and close both
+        flush — run_pipeline() flushes the timer, and closeEvent's save_config
+        re-emits the section from panel state regardless."""
         if gate_ok:
             if not isinstance(self.config_data.get("keywords"), dict):
                 self.config_data["keywords"] = {}
             self.config_data["keywords"]["advanced_scoring"] = section
-            self.save_config()
+            self._adv_save_timer.start()
         else:
             errors = self.advanced_scoring_panel.current_errors()
             self.append_log(
@@ -3653,8 +3668,13 @@ class VideoHighlighterGUI(QWidget):
         # Never start with an enabled-but-invalid section; this single check
         # covers the Run button and auto_start_pipeline (both call here).
         panel = getattr(self, "advanced_scoring_panel", None)
+        if panel is not None and self._adv_save_timer.isActive():
+            # Flush the debounced write-through: the pipeline re-reads
+            # config.yaml from disk, so pending edits must land first.
+            self._adv_save_timer.stop()
+            self.save_config()
         if (panel is not None
-                and bool(panel.current_model().get("enabled", False))
+                and panel.is_enabled()
                 and not panel.is_gate_ok()):
             errors = panel.current_errors()
             self.append_log(

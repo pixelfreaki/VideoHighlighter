@@ -230,22 +230,6 @@ def new_group(existing_ids: List[str]) -> Dict[str, Any]:
     return {"id": f"group_{n}", "weight": 1, "enabled": False, "words": []}
 
 
-def reorder_group(model: Dict[str, Any], from_index: int, to_index: int) -> Dict[str, Any]:
-    """Move the group at from_index to to_index, preserving every entry (R4).
-
-    Pure: returns a new model; the input is not mutated. Out-of-range indices
-    return the model unchanged (never raises -- consistent with KTD5).
-    """
-    result = copy.deepcopy(model)
-    groups = result.get("groups") or []
-    if not (0 <= from_index < len(groups)) or not (0 <= to_index < len(groups)):
-        return result
-    group = groups.pop(from_index)
-    groups.insert(to_index, group)
-    result["groups"] = groups
-    return result
-
-
 def reset_section() -> Dict[str, Any]:
     """The malformed-section card's reset action: the default empty section model,
     identical to a missing-section parse (KTD5). Does not write anything -- the
@@ -276,6 +260,7 @@ def resolve_section_for_save(
     panel_model: Optional[Dict[str, Any]],
     coercion_flags: Optional[List[str]],
     config_data: Dict[str, Any],
+    gate_ok: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """The single choke point save_config()/closeEvent route the section through (R10).
 
@@ -285,6 +270,10 @@ def resolve_section_for_save(
     or enabled-with-validation-errors (AE1/KTD3) -- return the on-disk subtree
     verbatim from config_data, so an invalid enabled state is never written and
     the wholesale config rewrite can never drop the section (AE3).
+
+    gate_ok, when not None, is the caller's already-computed persist-gate
+    verdict (the panel caches one per committed edit) -- passing it skips a
+    redundant full re-validation per save. None computes it here.
     """
     keywords = config_data.get("keywords", {}) if isinstance(config_data, dict) else {}
     on_disk = keywords.get("advanced_scoring", {}) if isinstance(keywords, dict) else {}
@@ -294,8 +283,9 @@ def resolve_section_for_save(
         return on_disk
     if coercion_flags:
         return on_disk
-    ok, _errors = should_persist(panel_model)
-    if not ok:
+    if gate_ok is None:
+        gate_ok, _errors = should_persist(panel_model)
+    if not gate_ok:
         return on_disk
     return serialize_section(panel_model)
 
@@ -305,7 +295,6 @@ __all__ = [
     "serialize_section",
     "import_simple_keywords",
     "new_group",
-    "reorder_group",
     "reset_section",
     "should_persist",
     "resolve_section_for_save",
