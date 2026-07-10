@@ -277,3 +277,50 @@ def test_match_keywords_simple_wraps_existing_function_unmodified():
     assert matches[0]["scoring_mode"] == "simple"
     assert matches[0]["weight"] == 8
     assert matches[0]["group"] is None
+
+
+# ---------------------------------------------------------------------------
+# R1 (U4): resolve_keyword_scoring()'s matches carry enough information for a
+# consumer to reconstruct pipeline.py's pre-feature per-second keyword score
+# byte-for-byte. pipeline.py's old logic expanded each match's full
+# [main_segment.start, main_segment.end] range to a flat KEYWORD_POINTS per
+# second (deduped via a set); this proves that reconstruction still holds
+# through resolve_keyword_scoring()'s reshaped "matches" list (not just its
+# point-only score_by_second, which collapses to a single second per match
+# and is not what pipeline.py's per-second scoring actually consumes).
+# ---------------------------------------------------------------------------
+
+def test_resolve_keyword_scoring_matches_reconstruct_pre_feature_per_second_score():
+    segments = [
+        _seg("estou morta agora mesmo", 5.0, 7.0),   # multi-second segment
+        _seg("nada relevante aqui", 20.0, 20.5),
+        _seg("vou morrer", 30.0, 30.0),
+    ]
+    search_keywords = ["estou morta", "vou morrer"]
+    keyword_points = 8
+
+    # Pre-feature baseline: pipeline.py's old keyword_set/KEYWORD_POINTS logic,
+    # computed directly against search_transcript_for_keywords.
+    baseline_raw = search_transcript_for_keywords(segments, search_keywords)
+    baseline_score = {}
+    for match in baseline_raw:
+        seg = match["main_segment"]
+        for sec in range(int(seg["start"]), int(seg["end"]) + 1):
+            baseline_score[sec] = keyword_points
+
+    result = resolve_keyword_scoring(
+        segments,
+        gui_config={"search_keywords": search_keywords, "keyword_points": keyword_points},
+        config={},
+    )
+
+    # Reconstruct the same range-expansion + max-per-second reduction pipeline.py
+    # now performs against resolve_keyword_scoring()'s matches.
+    reconstructed_score = {}
+    for m in result["matches"]:
+        for sec in range(int(m["start"]), int(m["end"]) + 1):
+            weight = m["weight"]
+            if sec not in reconstructed_score or weight > reconstructed_score[sec]:
+                reconstructed_score[sec] = weight
+
+    assert reconstructed_score == baseline_score
