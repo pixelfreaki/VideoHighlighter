@@ -47,7 +47,7 @@ def test_normalize_text_remove_accents_flag_off():
 def test_normalize_text_remove_punctuation_flag_off():
     result = normalize_text("AI, NÃO!", lowercase=True, remove_accents=True,
                              remove_punctuation=False, collapse_whitespace=True)
-    assert "," in result or "!" in result
+    assert result == "ai, nao!"
 
 
 def test_normalize_text_collapse_whitespace_flag_off():
@@ -150,6 +150,49 @@ def test_match_keywords_advanced_different_keywords_score_independently_in_coold
     assert len(matches) == 2
 
 
+def test_match_keywords_advanced_disabled_group_with_words_is_never_matched():
+    config = _two_group_config(groups=[
+        {"id": "g", "weight": 10, "words": ["morri"], "enabled": False},
+    ])
+
+    matches, skips = match_keywords_advanced([_seg("eu morri", 0.0, 1.0)], config)
+
+    assert matches == []
+
+
+def test_match_keywords_advanced_overlap_prevention_disabled_scores_both_phrases():
+    config = _two_group_config(groups=[
+        {"id": "g", "weight": 10, "words": ["meu deus", "ai meu deus"]},
+    ], prevent_overlapping_matches=False)
+
+    matches, skips = match_keywords_advanced([_seg("ai meu deus", 0.0, 1.0)], config)
+
+    assert {m["keyword"] for m in matches} == {"meu deus", "ai meu deus"}
+    assert not any(s["reason"] == "overlap" for s in skips)
+
+
+def test_match_keywords_advanced_cooldown_skipped_longer_phrase_still_blocks_shorter_overlap():
+    """R7: a longer phrase textually occupies its span even when it's itself
+    cooldown-skipped -- a shorter overlapping keyword must not sneak through."""
+    config = _two_group_config(groups=[
+        {"id": "g", "weight": 10, "words": ["ai meu deus", "deus"]},
+    ], cooldown_seconds=100)
+    segments = [
+        _seg("ai meu deus", 0.0, 1.0),
+        _seg("ai meu deus", 10.0, 11.0),  # within cooldown -- "ai meu deus" itself skips
+    ]
+
+    matches, skips = match_keywords_advanced(segments, config)
+
+    # Only the first "ai meu deus" match; the second segment's "ai meu deus" is
+    # cooldown-skipped, and "deus" must be overlap-skipped (not scored) there too.
+    assert len(matches) == 1
+    assert matches[0]["start"] == 0.0
+    second_segment_skips = [s for s in skips if s["start"] == 10.0]
+    assert any(s["reason"] == "cooldown" and s["keyword"] == "ai meu deus" for s in second_segment_skips)
+    assert any(s["reason"] == "overlap" and s["keyword"] == "deus" for s in second_segment_skips)
+
+
 def test_score_by_second_takes_max_not_sum_across_groups():
     segments = [_seg("caraca vou morrer", 10.0, 11.0)]
     result = resolve_keyword_scoring(
@@ -207,6 +250,31 @@ def test_validate_rejects_duplicate_keyword_across_groups():
     assert any("duplicate normalized keyword" in e and "danger" in e and "panic" in e for e in errors)
 
 
+def test_validate_rejects_non_list_groups_instead_of_crashing():
+    # A plausible YAML mistake (forgetting the list dash: "groups: my_group")
+    # must not raise -- it must surface as a clean validation error (R13).
+    errors = validate_advanced_scoring_config({"groups": "my_group"})
+    assert any("must be a list" in e for e in errors)
+
+
+def test_validate_rejects_non_numeric_cooldown_seconds():
+    config = {"groups": [{"id": "a", "weight": 1, "words": ["x"]}], "cooldown_seconds": "oops"}
+    errors = validate_advanced_scoring_config(config)
+    assert any("cooldown_seconds must be numeric" in e for e in errors)
+
+
+def test_validate_rejects_non_list_words_instead_of_silently_iterating_characters():
+    config = {"groups": [{"id": "a", "weight": 1, "words": "chef"}]}
+    errors = validate_advanced_scoring_config(config)
+    assert any("must be a list" in e for e in errors)
+
+
+def test_validate_rejects_missing_group_id():
+    config = {"groups": [{"weight": 1, "words": ["x"]}]}
+    errors = validate_advanced_scoring_config(config)
+    assert any("has no id" in e for e in errors)
+
+
 # ---------------------------------------------------------------------------
 # resolve_keyword_scoring
 # ---------------------------------------------------------------------------
@@ -257,7 +325,10 @@ def test_resolve_keyword_scoring_simple_mode_matches_search_transcript_for_keywo
     )
 
     baseline_raw = search_transcript_for_keywords(segments, search_keywords)
-    baseline_seconds = {int(m["main_segment"]["start"]) for m in baseline_raw}
+    baseline_seconds = set()
+    for m in baseline_raw:
+        seg = m["main_segment"]
+        baseline_seconds.update(range(int(seg["start"]), int(seg["end"]) + 1))
 
     result_seconds = set(result["score_by_second"].keys())
     assert result_seconds == baseline_seconds

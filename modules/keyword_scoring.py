@@ -19,6 +19,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from modules.transcript import search_transcript_for_keywords
 
+MODE_SIMPLE = "simple"
+MODE_ADVANCED = "advanced"
+
+
+def get_advanced_scoring_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The nested config.yaml-only accessor for keywords.advanced_scoring (KTD2).
+
+    Shared by pipeline.py and resolve_keyword_scoring() so the read path can't
+    drift between callers. modules/video_cache.py keeps its own copy of this
+    one-liner rather than importing it, to stay free of this module's
+    transitive heavy dependency (modules.transcript -> whisper).
+    """
+    return config.get("keywords", {}).get("advanced_scoring", {}) or {}
+
 
 def normalize_text(
     text: str,
@@ -55,14 +69,28 @@ def validate_advanced_scoring_config(advanced_scoring: Dict[str, Any]) -> List[s
     errors: List[str] = []
     groups = advanced_scoring.get("groups") or []
 
+    if not isinstance(groups, list):
+        errors.append(f"advanced_scoring.groups must be a list (got {type(groups).__name__})")
+        return errors
+
     if not groups:
         errors.append("advanced_scoring.enabled is true but no groups are configured")
         return errors
+
+    cooldown_seconds = advanced_scoring.get("cooldown_seconds", 5)
+    try:
+        float(cooldown_seconds)
+    except (TypeError, ValueError):
+        errors.append(f"advanced_scoring.cooldown_seconds must be numeric (got {cooldown_seconds!r})")
 
     seen_ids = set()
     seen_keywords_global: Dict[str, str] = {}  # normalized keyword -> owning group label
 
     for i, group in enumerate(groups):
+        if not isinstance(group, dict):
+            errors.append(f"group at index {i} must be a mapping (got {type(group).__name__})")
+            continue
+
         group_id = str(group.get("id") or "").strip()
         label = group_id or f"<group at index {i}>"
 
@@ -81,7 +109,11 @@ def validate_advanced_scoring_config(advanced_scoring: Dict[str, Any]) -> List[s
             errors.append(f"group '{label}' has a non-numeric weight ({weight!r})")
 
         enabled = group.get("enabled", True)
-        words = [str(w).strip() for w in (group.get("words") or []) if str(w).strip()]
+        raw_words = group.get("words") or []
+        if not isinstance(raw_words, list):
+            errors.append(f"group '{label}' has words that must be a list (got {type(raw_words).__name__})")
+            continue
+        words = [str(w).strip() for w in raw_words if str(w).strip()]
 
         # R13: "at least one non-blank keyword" applies to enabled groups only --
         # a disabled group is preserved but never matched (R5), so an empty word
@@ -152,6 +184,12 @@ def match_keywords_advanced(
             if norm_word:
                 entries.append((norm_word, word, group_id, weight))
     entries.sort(key=lambda e: len(e[0]), reverse=True)
+    # Compile each keyword's pattern once, not once per segment -- pattern
+    # depends only on norm_word, which is invariant across the segment loop.
+    compiled_entries = [
+        (re.compile(r"(?<!\w)" + re.escape(norm_word) + r"(?!\w)"), norm_word, original_word, group_id, weight)
+        for norm_word, original_word, group_id, weight in entries
+    ]
 
     matches: List[Dict[str, Any]] = []
     skip_events: List[Dict[str, Any]] = []
@@ -164,9 +202,8 @@ def match_keywords_advanced(
         seg_end = seg.get("end", 0)
         claimed_spans: List[Tuple[int, int]] = []
 
-        for norm_word, original_word, group_id, weight in entries:
-            pattern = r"(?<!\w)" + re.escape(norm_word) + r"(?!\w)"
-            for m in re.finditer(pattern, normalized_text):
+        for pattern, norm_word, original_word, group_id, weight in compiled_entries:
+            for m in pattern.finditer(normalized_text):
                 span = (m.start(), m.end())
 
                 if prevent_overlap and any(_spans_overlap(span, cs) for cs in claimed_spans):
@@ -176,6 +213,13 @@ def match_keywords_advanced(
                     })
                     continue
 
+                # Claim the span as soon as it clears the overlap check, before the
+                # cooldown check -- a longer phrase that's cooldown-skipped still
+                # textually occupies this position and must still block a shorter
+                # overlapping keyword from matching here (R7).
+                if prevent_overlap:
+                    claimed_spans.append(span)
+
                 last_time = last_seen_at.get(norm_word)
                 if last_time is not None and (seg_start - last_time) < cooldown_seconds:
                     skip_events.append({
@@ -184,7 +228,6 @@ def match_keywords_advanced(
                     })
                     continue
 
-                claimed_spans.append(span)
                 last_seen_at[norm_word] = seg_start
                 matches.append({
                     "keyword": original_word,
@@ -194,7 +237,7 @@ def match_keywords_advanced(
                     "normalized_text": normalized_text,
                     "start": seg_start,
                     "end": seg_end,
-                    "scoring_mode": "advanced",
+                    "scoring_mode": MODE_ADVANCED,
                 })
 
     return matches, skip_events
@@ -222,7 +265,7 @@ def match_keywords_simple(
             "normalized_text": (seg.get("text", "") or "").lower(),
             "start": seg.get("start", m.get("start", 0)),
             "end": seg.get("end", m.get("end", 0)),
-            "scoring_mode": "simple",
+            "scoring_mode": MODE_SIMPLE,
         })
     return reshaped
 
@@ -244,7 +287,7 @@ def resolve_keyword_scoring(
     matches per unique second to the MAXIMUM weight among that second's matches
     (not a sum -- see plan Key Decisions).
     """
-    advanced_scoring = config.get("keywords", {}).get("advanced_scoring", {}) or {}
+    advanced_scoring = get_advanced_scoring_config(config)
     enabled = bool(advanced_scoring.get("enabled", False))
 
     if not enabled:
@@ -252,7 +295,7 @@ def resolve_keyword_scoring(
         keyword_points = gui_config.get("keyword_points", config.get("keyword_points", 2))
         matches = match_keywords_simple(transcript_segments, search_keywords, keyword_points)
         return {
-            "mode": "simple",
+            "mode": MODE_SIMPLE,
             "matches": matches,
             "score_by_second": _score_by_second(matches),
             "skip_events": [],
@@ -262,7 +305,7 @@ def resolve_keyword_scoring(
     validation_errors = validate_advanced_scoring_config(advanced_scoring)
     if validation_errors:
         return {
-            "mode": "advanced",
+            "mode": MODE_ADVANCED,
             "matches": [],
             "score_by_second": {},
             "skip_events": [],
@@ -271,7 +314,7 @@ def resolve_keyword_scoring(
 
     matches, skip_events = match_keywords_advanced(transcript_segments, advanced_scoring)
     return {
-        "mode": "advanced",
+        "mode": MODE_ADVANCED,
         "matches": matches,
         "score_by_second": _score_by_second(matches),
         "skip_events": skip_events,
@@ -280,11 +323,16 @@ def resolve_keyword_scoring(
 
 
 def _score_by_second(matches: List[Dict[str, Any]]) -> Dict[int, float]:
-    """Collapse matches per unique second to the max weight in that second (not a sum)."""
+    """Collapse matches to a per-second score, taking the MAX weight (not a sum) among
+    matches touching each second. Expands each match's full [start, end] second range,
+    not just its start second, mirroring how a full-length transcript segment should
+    contribute to every second it spans."""
     score_by_second: Dict[int, float] = {}
     for m in matches:
-        sec = int(m.get("start", 0))
+        start_sec = int(m.get("start", 0))
+        end_sec = int(m.get("end", start_sec))
         weight = m.get("weight", 0) or 0
-        if sec not in score_by_second or weight > score_by_second[sec]:
-            score_by_second[sec] = weight
+        for sec in range(start_sec, end_sec + 1):
+            if sec not in score_by_second or weight > score_by_second[sec]:
+                score_by_second[sec] = weight
     return score_by_second

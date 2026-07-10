@@ -77,7 +77,7 @@ class ProgressTracker:
 try:
     from modules.transcript import get_transcript_segments
     from modules.transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
-    from modules.keyword_scoring import resolve_keyword_scoring
+    from modules.keyword_scoring import resolve_keyword_scoring, get_advanced_scoring_config, MODE_SIMPLE, MODE_ADVANCED
     TRANSCRIPT_AVAILABLE = True
 except ImportError:
     TRANSCRIPT_AVAILABLE = False
@@ -486,9 +486,9 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         TRANSCRIPT_SOURCE_LANG = gui_config.get("transcript_source_lang", "en")
         SEARCH_KEYWORDS = gui_config.get("search_keywords", [])
         # keywords.advanced_scoring is config.yaml-only (no GUI mirror in this pass), so it's
-        # read via the nested config accessor, not the flat gui_config-fallback pattern used
-        # for GUI-backed settings above (see docs/plans/2026-07-10-003-feat-advanced-keyword-scoring-plan.md KTD2).
-        ADVANCED_SCORING_CFG = config.get("keywords", {}).get("advanced_scoring", {}) or {}
+        # read via the shared nested config accessor (KTD2), not the flat gui_config-fallback
+        # pattern used for GUI-backed settings above.
+        ADVANCED_SCORING_CFG = get_advanced_scoring_config(config)
         ADVANCED_SCORING_ENABLED = bool(ADVANCED_SCORING_CFG.get("enabled", False))
         CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
         TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
@@ -504,7 +504,11 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         forbidden_boxes_by_frame = {}  # {frame_idx: [(x1,y1,x2,y2), ...]} avoided ids only
 
         keyword_matches = []
-        KEYWORD_SCORING_MODE = "simple"
+        # Reflects config state even in paths that never call _resolve_and_log_keywords
+        # (e.g. advanced mode enabled but transcript_segments end up empty) -- avoids
+        # misleading simple-mode sanity warnings and a wrong scoring ceiling below.
+        KEYWORD_SCORING_MODE = MODE_ADVANCED if ADVANCED_SCORING_ENABLED else MODE_SIMPLE
+        KEYWORD_SCORE_BY_SECOND = {}
 
         target_duration = EXACT_DURATION if EXACT_DURATION else MAX_DURATION
         duration_mode = "EXACT" if EXACT_DURATION else "MAX"
@@ -896,22 +900,27 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             and each cooldown-/overlap-skip; hard-gates (R13) when advanced mode is
             enabled but misconfigured, mirroring the actions_require_objects gate above
             (log the errors, return None so the caller aborts the run). Returns
-            (keyword_matches, mode) on success, (None, None) on abort. keyword_matches
-            is reshaped into the pre-existing main_segment-keyed shape so downstream
-            consumers (build_auto_segments, the cache payload) need no changes.
+            (keyword_matches, mode, score_by_second) on success, (None, None, None) on
+            abort. keyword_matches is reshaped into the pre-existing main_segment-keyed
+            shape so downstream consumers (build_auto_segments, the cache payload) need
+            no changes. score_by_second is the resolver's own per-second max-weight
+            reduction -- passed through as-is so the scoring section below doesn't
+            need its own duplicate reduction over keyword_matches.
             """
+            LOG_PREVIEW_LIMIT = 10
             kw_result = resolve_keyword_scoring(segs, gui_config, config)
-            if kw_result["mode"] == "advanced" and kw_result["validation_errors"]:
+            if kw_result["mode"] == MODE_ADVANCED and kw_result["validation_errors"]:
                 log("❌ Advanced keyword scoring is enabled but misconfigured:")
                 for err in kw_result["validation_errors"]:
                     log(f"   - {err}")
-                return None, None
+                return None, None, None
 
             log(f"🔹 Keyword scoring mode: {kw_result['mode']}")
             reshaped = []
             for m in kw_result["matches"]:
-                log(f"   Match: '{m['keyword']}' (group={m['group']}, weight={m['weight']}) "
-                    f"at {int(m['start'])}-{int(m['end'])}s")
+                if len(reshaped) < LOG_PREVIEW_LIMIT:
+                    log(f"   Match: '{m['keyword']}' (group={m['group']}, weight={m['weight']}) "
+                        f"at {int(m['start'])}-{int(m['end'])}s")
                 reshaped.append({
                     "keyword": m["keyword"],
                     "group": m["group"],
@@ -919,11 +928,18 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     "scoring_mode": m["scoring_mode"],
                     "main_segment": {"start": m["start"], "end": m["end"], "text": m["original_text"]},
                 })
-            for s in kw_result["skip_events"]:
+            if len(reshaped) > LOG_PREVIEW_LIMIT:
+                log(f"   ...and {len(reshaped) - LOG_PREVIEW_LIMIT} more match(es)")
+
+            skip_events = kw_result["skip_events"]
+            for s in skip_events[:LOG_PREVIEW_LIMIT]:
                 log(f"   Skip ({s['reason']}): '{s['keyword']}' (group={s['group']}) at {int(s['start'])}-{int(s['end'])}s")
+            if len(skip_events) > LOG_PREVIEW_LIMIT:
+                log(f"   ...and {len(skip_events) - LOG_PREVIEW_LIMIT} more skip(s)")
+
             if not reshaped:
                 log("⚠️ No keyword matches found!")
-            return reshaped, kw_result["mode"]
+            return reshaped, kw_result["mode"], kw_result["score_by_second"]
 
         # --- Transcript processing ---
         progress.start_stage("transcript")
@@ -968,7 +984,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
                 if (SEARCH_KEYWORDS or ADVANCED_SCORING_ENABLED) and transcript_segments:
                     check_cancellation(cancel_flag, log, "keyword search")
-                    keyword_matches, KEYWORD_SCORING_MODE = _resolve_and_log_keywords(transcript_segments)
+                    keyword_matches, KEYWORD_SCORING_MODE, KEYWORD_SCORE_BY_SECOND = _resolve_and_log_keywords(transcript_segments)
                     if keyword_matches is None:
                         return None
                 else:
@@ -980,7 +996,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
             # Re-run keyword search on cached transcript
             if (SEARCH_KEYWORDS or ADVANCED_SCORING_ENABLED) and transcript_segments:
-                keyword_matches, KEYWORD_SCORING_MODE = _resolve_and_log_keywords(transcript_segments)
+                keyword_matches, KEYWORD_SCORING_MODE, KEYWORD_SCORE_BY_SECOND = _resolve_and_log_keywords(transcript_segments)
                 if keyword_matches is None:
                     return None
             else:
@@ -1691,22 +1707,11 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         MIN_SIGNALS_FOR_BOOST = gui_config.get("min_signals_for_boost", config.get("min_signals_for_boost", 2))
         OBJECT_POINTS = gui_config.get("object_points", config.get("object_points", 10))
         ACTION_POINTS = gui_config.get("action_points", config.get("action_points", 10))
-        # keyword_weight_by_sec collapses each match's full [main_segment.start, main_segment.end]
-        # range to its weight, taking the MAX across overlapping matches per second (not a sum --
-        # see plan Key Decisions). In simple mode every match's weight is the same flat
-        # KEYWORD_POINTS, so this reduces to exactly the pre-existing "add once per second" behavior.
-        keyword_set = set()
-        keyword_weight_by_sec = {}
-        if keyword_matches:
-            for match in keyword_matches:
-                main_seg = match["main_segment"]
-                start_sec = int(main_seg["start"])
-                end_sec = int(main_seg["end"])
-                weight = match.get("weight", KEYWORD_POINTS)
-                for sec in range(start_sec, end_sec + 1):
-                    keyword_set.add(sec)
-                    if sec not in keyword_weight_by_sec or weight > keyword_weight_by_sec[sec]:
-                        keyword_weight_by_sec[sec] = weight
+        # KEYWORD_SCORE_BY_SECOND is resolve_keyword_scoring()'s own per-second max-weight
+        # reduction (max across overlapping matches per second, not a sum -- see plan Key
+        # Decisions), computed once by _resolve_and_log_keywords above and passed through
+        # as-is -- no need to re-derive it here from keyword_matches.
+        keyword_weight_by_sec = KEYWORD_SCORE_BY_SECOND
 
         # Get the require_objects flag (needed for sanity warnings below)
         actions_require_objects = gui_config.get("actions_require_objects", False)
@@ -1724,7 +1729,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # Advanced mode's contribution ceiling comes from configured group weights, not
         # SEARCH_KEYWORDS/KEYWORD_POINTS -- warning on those here would be misleading (R12).
-        if KEYWORD_SCORING_MODE == "advanced":
+        if KEYWORD_SCORING_MODE == MODE_ADVANCED:
             enabled_weights = [float(g.get("weight", 0) or 0)
                                 for g in (ADVANCED_SCORING_CFG.get("groups") or []) if g.get("enabled", True)]
             keyword_points_ceiling = max(enabled_weights) if enabled_weights else 0
@@ -1862,7 +1867,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 i in motion_set,
                 i in motion_peaks_set,
                 i in audio_set,
-                i in keyword_set,
+                i in keyword_weight_by_sec,
                 i in object_set,
                 i in action_set
             ])

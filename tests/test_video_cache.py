@@ -366,6 +366,69 @@ def test_advanced_scoring_absent_and_explicitly_disabled_produce_same_signature(
     assert absent["advanced_scoring"] == disabled_with_leftover_groups["advanced_scoring"]
 
 
+def test_advanced_scoring_cooldown_seconds_change_changes_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(cooldown_seconds=5)}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(cooldown_seconds=30)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base != changed
+
+
+def test_advanced_scoring_prevent_overlapping_matches_change_changes_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(prevent_overlapping_matches=True)}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(prevent_overlapping_matches=False)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base != changed
+
+
+def test_advanced_scoring_each_normalization_flag_change_changes_signature():
+    base_normalization = {"lowercase": True, "remove_accents": True,
+                           "remove_punctuation": True, "collapse_whitespace": True}
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(normalization=base_normalization)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    for flag in base_normalization:
+        flipped = dict(base_normalization)
+        flipped[flag] = not flipped[flag]
+        other = build_analysis_cache_params(
+            {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(normalization=flipped)}},
+            sample_rate=5, video_duration=60.0,
+        )
+        assert base != other, f"flipping normalization.{flag} did not change the signature"
+
+
+def test_advanced_scoring_signature_defaults_match_keyword_scoring_defaults():
+    """Drift guard: modules/video_cache.py duplicates modules/keyword_scoring.py's
+    normalization/cooldown/overlap defaults (by design, to avoid the whisper
+    dependency -- see the comment above _advanced_scoring's config read in
+    video_cache.py). Pin the literal values here so a future default change in
+    one file without the other fails a test instead of silently drifting."""
+    params = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": {"enabled": True, "groups": []}}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert params["advanced_scoring"]["normalization"] == {
+        "lowercase": True, "remove_accents": True,
+        "remove_punctuation": True, "collapse_whitespace": True,
+    }
+    assert params["advanced_scoring"]["prevent_overlapping_matches"] is True
+    assert params["advanced_scoring"]["cooldown_seconds"] == 5.0
+
+
 # ---------------------------------------------------------------------------
 # R15: signature coverage against a realistic config shape (U4) -- proves the
 # nested config.get("keywords", {}).get("advanced_scoring", {}) read (KTD2)

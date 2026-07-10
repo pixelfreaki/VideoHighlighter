@@ -71,7 +71,10 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
     search_keywords = gui_config.get("search_keywords", []) or []
 
     # keywords.advanced_scoring has no GUI in this pass -- config.yaml-only, read via
-    # the nested accessor (not gui_config, which never carries this key).
+    # the nested accessor (not gui_config, which never carries this key). Duplicated
+    # here rather than importing modules.keyword_scoring.get_advanced_scoring_config
+    # to keep this module's zero-heavy-dependency guarantee (that module transitively
+    # imports modules.transcript -> whisper).
     advanced_scoring = config.get("keywords", {}).get("advanced_scoring", {}) or {}
 
     # Time range settings (if enabled)
