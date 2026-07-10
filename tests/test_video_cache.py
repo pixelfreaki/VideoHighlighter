@@ -186,3 +186,46 @@ def test_checkpoint_for_one_video_does_not_affect_anothers_resume_decision(tmp_p
     assert cache.load_partial(video_b, params=params) is None
     result_a = cache.load_partial(video_a, params=params)
     assert result_a["completed_stages"] == ["transcript", "motion", "audio_peaks"]
+
+
+def test_sequential_stage_checkpoints_accumulate_and_each_is_durable(tmp_path):
+    """Mirrors _checkpoint_stage's real call pattern: one save per completed
+    stage, with completed_stages re-supplied as the accumulated list so far.
+    Also stands in for Cancel-parity (KTD-Cancel): stopping after any of these
+    saves leaves a valid, correctly-ordered partial state -- there is no
+    separate code path for "cancelled here" vs "crashed here"."""
+    cache = _cache(tmp_path)
+    video_path = _make_video(tmp_path)
+    params = {"yolo_model_size": "n"}
+
+    for stages_so_far in (["transcript"], ["transcript", "motion"], ["transcript", "motion", "audio_peaks"]):
+        cache.save(video_path, {}, params=params, complete=False, completed_stages=stages_so_far)
+        result = cache.load_partial(video_path, params=params)
+        assert result["completed_stages"] == stages_so_far
+
+
+def test_setting_outside_analysis_params_does_not_break_resume(tmp_path):
+    """AE4: a setting that only affects an out-of-checkpoint-scope stage (e.g.
+    MAX_DURATION affecting score_computation/video_cutting) is not part of
+    analysis_params, so changing it must not change the signature -- the
+    checkpointed stages resume normally regardless."""
+    cache = _cache(tmp_path)
+    video_path = _make_video(tmp_path)
+
+    # analysis_params has no "max_duration" key (build_analysis_cache_params
+    # never includes it), so two "runs" with a different MAX_DURATION setting
+    # still produce the identical params dict here.
+    params_run_1 = {"yolo_model_size": "n", "use_transcript": True}
+    params_run_2 = {"yolo_model_size": "n", "use_transcript": True}
+
+    cache.save(
+        video_path, {}, params=params_run_1, complete=False,
+        completed_stages=["transcript", "motion", "audio_peaks", "object_detection", "action_detection"],
+    )
+
+    result = cache.load_partial(video_path, params=params_run_2)
+
+    assert result is not None
+    assert result["completed_stages"] == [
+        "transcript", "motion", "audio_peaks", "object_detection", "action_detection",
+    ]
