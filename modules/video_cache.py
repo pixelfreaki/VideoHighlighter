@@ -23,12 +23,59 @@ import shutil
 
 # ========== DATA CLASSES (unchanged external API) ==========
 
+def _advanced_scoring_signature(advanced_scoring: dict) -> dict:
+    """Normalize keywords.advanced_scoring into a stable, sorted representation for
+    the analysis-cache signature. Covers only match-affecting settings -- group
+    ids/word-sets, normalization/overlap/cooldown settings, and the enabled flag.
+
+    Group `weight` is deliberately excluded: it's a pure scoring multiplier that
+    never changes which seconds match, only how much a match is worth -- the same
+    reason scoring.keyword_points is already excluded from this signature today.
+    Including it would force a full checkpoint recompute on routine weight tuning.
+    """
+    if not bool(advanced_scoring.get("enabled", False)):
+        return {"enabled": False}
+
+    groups_sig = []
+    for group in advanced_scoring.get("groups", []) or []:
+        words = sorted({
+            str(w).strip().lower() for w in (group.get("words") or []) if str(w).strip()
+        })
+        groups_sig.append({
+            "id": str(group.get("id") or ""),
+            "enabled": bool(group.get("enabled", True)),
+            "words": words,
+        })
+    groups_sig.sort(key=lambda g: g["id"])
+
+    normalization = advanced_scoring.get("normalization", {}) or {}
+    return {
+        "enabled": True,
+        "groups": groups_sig,
+        "normalization": {
+            "lowercase": bool(normalization.get("lowercase", True)),
+            "remove_accents": bool(normalization.get("remove_accents", True)),
+            "remove_punctuation": bool(normalization.get("remove_punctuation", True)),
+            "collapse_whitespace": bool(normalization.get("collapse_whitespace", True)),
+        },
+        "prevent_overlapping_matches": bool(advanced_scoring.get("prevent_overlapping_matches", True)),
+        "cooldown_seconds": float(advanced_scoring.get("cooldown_seconds", 5) or 0),
+    }
+
+
 def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int, video_duration: float):
     # “Analysis params” = anything that changes the computed analysis artifacts
     # Keep values JSON-serializable and stable (sort lists)
     highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", [])) or []
     interesting_actions = gui_config.get("interesting_actions", []) or []
     search_keywords = gui_config.get("search_keywords", []) or []
+
+    # keywords.advanced_scoring has no GUI in this pass -- config.yaml-only, read via
+    # the nested accessor (not gui_config, which never carries this key). Duplicated
+    # here rather than importing modules.keyword_scoring.get_advanced_scoring_config
+    # to keep this module's zero-heavy-dependency guarantee (that module transitively
+    # imports modules.transcript -> whisper).
+    advanced_scoring = config.get("keywords", {}).get("advanced_scoring", {}) or {}
 
     # Time range settings (if enabled)
     use_time_range = bool(gui_config.get("use_time_range", False))
@@ -87,6 +134,11 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "spike_factor": float(gui_config.get("spike_factor", 1.2)),
         "freeze_seconds": float(gui_config.get("freeze_seconds", 4)),
         "freeze_factor": float(gui_config.get("freeze_factor", 0.8)),
+
+        # advanced keyword scoring: match-affecting settings only (weight excluded,
+        # see _advanced_scoring_signature) -- must be signature-covered so a resumed
+        # run never reuses a checkpoint whose matches came from different settings.
+        "advanced_scoring": _advanced_scoring_signature(advanced_scoring),
     }
     return params
 

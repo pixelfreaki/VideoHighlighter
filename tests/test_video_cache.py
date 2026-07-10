@@ -270,3 +270,239 @@ def test_motion_skipped_checkpoint_does_not_resume_under_raised_point_settings(t
     # motion (and everything after it) reruns instead of silently resuming
     # with stale empty data.
     assert cache.load_partial(video_path, params=params_raised) is None
+
+
+# ---------------------------------------------------------------------------
+# Advanced keyword scoring signature coverage (U2) -- match-affecting settings
+# only, weight excluded (KTD5)
+# ---------------------------------------------------------------------------
+
+def _advanced_scoring_config(**overrides):
+    config = {
+        "enabled": True,
+        "prevent_overlapping_matches": True,
+        "cooldown_seconds": 5,
+        "normalization": {"lowercase": True, "remove_accents": True,
+                           "remove_punctuation": True, "collapse_whitespace": True},
+        "groups": [{"id": "panic", "weight": 15, "words": ["vou morrer"]}],
+    }
+    config.update(overrides)
+    return config
+
+
+def test_advanced_scoring_enabled_flag_changes_signature():
+    disabled = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(enabled=False)}},
+        sample_rate=5, video_duration=60.0,
+    )
+    enabled = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(enabled=True)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert disabled != enabled
+
+
+def test_advanced_scoring_word_list_change_changes_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config()}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed_words = _advanced_scoring_config()
+    changed_words["groups"][0]["words"] = ["morri"]
+    other = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": changed_words}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base != other
+
+
+def test_advanced_scoring_weight_only_change_does_not_change_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config()}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed_weight = _advanced_scoring_config()
+    changed_weight["groups"][0]["weight"] = 999
+    other = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": changed_weight}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base == other
+
+
+def test_advanced_scoring_yaml_reordering_does_not_change_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(
+            groups=[
+                {"id": "reaction", "weight": 6, "words": ["caraca", "bugou"]},
+                {"id": "panic", "weight": 15, "words": ["vou morrer"]},
+            ],
+        )}},
+        sample_rate=5, video_duration=60.0,
+    )
+    reordered = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(
+            groups=[
+                {"id": "panic", "weight": 15, "words": ["vou morrer"]},
+                {"id": "reaction", "weight": 6, "words": ["bugou", "caraca"]},
+            ],
+        )}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base == reordered
+
+
+def test_advanced_scoring_absent_and_explicitly_disabled_produce_same_signature():
+    absent = build_analysis_cache_params({}, {}, sample_rate=5, video_duration=60.0)
+    disabled_with_leftover_groups = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(enabled=False)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert absent["advanced_scoring"] == disabled_with_leftover_groups["advanced_scoring"]
+
+
+def test_advanced_scoring_cooldown_seconds_change_changes_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(cooldown_seconds=5)}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(cooldown_seconds=30)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base != changed
+
+
+def test_advanced_scoring_prevent_overlapping_matches_change_changes_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(prevent_overlapping_matches=True)}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(prevent_overlapping_matches=False)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base != changed
+
+
+def test_advanced_scoring_each_normalization_flag_change_changes_signature():
+    base_normalization = {"lowercase": True, "remove_accents": True,
+                           "remove_punctuation": True, "collapse_whitespace": True}
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(normalization=base_normalization)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    for flag in base_normalization:
+        flipped = dict(base_normalization)
+        flipped[flag] = not flipped[flag]
+        other = build_analysis_cache_params(
+            {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(normalization=flipped)}},
+            sample_rate=5, video_duration=60.0,
+        )
+        assert base != other, f"flipping normalization.{flag} did not change the signature"
+
+
+def test_advanced_scoring_signature_defaults_match_keyword_scoring_defaults():
+    """Drift guard: modules/video_cache.py duplicates modules/keyword_scoring.py's
+    normalization/cooldown/overlap defaults (by design, to avoid the whisper
+    dependency -- see the comment above _advanced_scoring's config read in
+    video_cache.py). Pin the literal values here so a future default change in
+    one file without the other fails a test instead of silently drifting."""
+    params = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": {"enabled": True, "groups": []}}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert params["advanced_scoring"]["normalization"] == {
+        "lowercase": True, "remove_accents": True,
+        "remove_punctuation": True, "collapse_whitespace": True,
+    }
+    assert params["advanced_scoring"]["prevent_overlapping_matches"] is True
+    assert params["advanced_scoring"]["cooldown_seconds"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# R15: signature coverage against a realistic config shape (U4) -- proves the
+# nested config.get("keywords", {}).get("advanced_scoring", {}) read (KTD2)
+# actually reaches the section inside a full config.yaml-shaped document with
+# sibling sections and an unrelated "keywords.interesting" list, and that a
+# realistic, fully-populated gui_config (resembling main.py's
+# build_pipeline_config() output, which never carries a "keywords" key at all)
+# doesn't interfere. Not a restatement of U2's isolated-dict tests above.
+# ---------------------------------------------------------------------------
+
+def _realistic_gui_config(**overrides):
+    # Mirrors the flat shape main.py's build_pipeline_config() actually returns --
+    # no "keywords" key anywhere, since advanced_scoring has no GUI in this pass.
+    gui_config = {
+        "scene_points": 0, "motion_event_points": 2, "motion_peak_points": 4,
+        "audio_peak_points": 3, "keyword_points": 8, "transcript_points": 1,
+        "beginning_points": 0, "ending_points": 0, "object_points": 4, "action_points": 6,
+        "clip_time": 240, "max_duration": 420, "multi_signal_boost": 1.2,
+        "min_signals_for_boost": 2, "keep_temp": True,
+        "highlight_objects": ["boss", "explosion"], "interesting_actions": ["killing boss"],
+        "actions_require_objects": False, "use_transcript": True, "transcript_model": "base",
+        "transcript_source_lang": "en", "search_keywords": ["estou morta", "vou morrer"],
+        "create_subtitles": False, "sample_rate": 5, "force_reprocess": False,
+    }
+    gui_config.update(overrides)
+    return gui_config
+
+
+def _realistic_yaml_config(**advanced_scoring_overrides):
+    # Mirrors config/config.yaml's real top-level shape: sibling sections plus a
+    # pre-existing, unrelated "keywords.interesting" list alongside advanced_scoring.
+    return {
+        "video": {"paths": ["C:/videos/clip.mp4"]},
+        "download": {"save_dir": "D:/movies", "auto_add": True},
+        "highlights": {"clip_time": 240, "max_duration": 420, "keep_temp": True},
+        "scoring": {"scene_points": 0, "keyword_points": 8, "object_points": 4},
+        "actions": {"interesting": ["killing boss"], "require_objects": False},
+        "objects": {"interesting": ["boss", "explosion"], "confidence": 30},
+        "keywords": {
+            "transcript_file": "transcript.txt",
+            "interesting": ["estou morta", "vou morrer", "ai não"],
+            "advanced_scoring": _advanced_scoring_config(**advanced_scoring_overrides),
+        },
+    }
+
+
+def test_realistic_config_shape_reaches_advanced_scoring_section():
+    params = build_analysis_cache_params(
+        _realistic_gui_config(), _realistic_yaml_config(), sample_rate=5, video_duration=120.0,
+    )
+
+    assert params["advanced_scoring"]["enabled"] is True
+    assert params["advanced_scoring"]["groups"][0]["id"] == "panic"
+
+
+def test_realistic_config_shape_word_list_change_still_changes_signature():
+    base = build_analysis_cache_params(
+        _realistic_gui_config(), _realistic_yaml_config(), sample_rate=5, video_duration=120.0,
+    )
+    changed = build_analysis_cache_params(
+        _realistic_gui_config(),
+        _realistic_yaml_config(groups=[{"id": "panic", "weight": 15, "words": ["morri"]}]),
+        sample_rate=5, video_duration=120.0,
+    )
+
+    assert base != changed
+
+
+def test_realistic_config_shape_with_advanced_scoring_absent_is_disabled():
+    yaml_config = _realistic_yaml_config()
+    del yaml_config["keywords"]["advanced_scoring"]
+
+    params = build_analysis_cache_params(
+        _realistic_gui_config(), yaml_config, sample_rate=5, video_duration=120.0,
+    )
+
+    assert params["advanced_scoring"] == {"enabled": False}
