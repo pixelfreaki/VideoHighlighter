@@ -46,6 +46,13 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+# Editor model is stdlib-only (safe at import time); the panel is pure Qt.
+# modules.keyword_scoring (whisper chain) is never imported at module level —
+# the editor's persist gate lazy-imports it.
+from modules.keyword_scoring_editor import (
+    import_simple_keywords, parse_section, resolve_section_for_save,
+)
+from video_ai_editor.keyword_scoring_panel import AdvancedScoringPanel
 
 try:
     import openvino  # registers OpenVINO's DLL dir on Windows
@@ -1342,6 +1349,31 @@ class VideoHighlighterGUI(QWidget):
         self.search_keywords_input.setPlaceholderText("goal, score, win")
         self.search_keywords_input.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow("Search keywords:", self.search_keywords_input)
+
+        # Shown while advanced scoring owns matching (R6); hidden otherwise
+        self.simple_keywords_note = QLabel(
+            "Ignored while Advanced keyword scoring is enabled — matching uses the groups below."
+        )
+        self.simple_keywords_note.setStyleSheet("color: #888; font-size: 10px;")
+        self.simple_keywords_note.setWordWrap(True)
+        self.simple_keywords_note.setVisible(False)
+        transcript_form.addRow("", self.simple_keywords_note)
+
+        # Advanced keyword scoring editor (keywords.advanced_scoring).
+        # parse_section never raises: a malformed section renders the panel's
+        # resettable parse-error card instead of breaking startup.
+        adv_model, adv_flags = parse_section(self.config_data)
+        self.advanced_scoring_panel = AdvancedScoringPanel(adv_model, adv_flags)
+        transcript_form.addRow(self.advanced_scoring_panel)
+        self.advanced_scoring_panel.master_toggled.connect(self.on_advanced_scoring_toggle)
+        self.advanced_scoring_panel.section_changed.connect(self.on_advanced_scoring_changed)
+        self.advanced_scoring_panel.import_requested.connect(self.on_import_simple_keywords)
+        self.search_keywords_input.textChanged.connect(self.refresh_import_button)
+        # Both-paths-in-sync: apply the grey-out and import-button state without
+        # a signal round-trip (construction never emits the panel's signals).
+        self.on_advanced_scoring_toggle(bool(adv_model.get("enabled", False)))
+        self.refresh_import_button()
+
         transcript_group.setLayout(transcript_form)
         transcript_layout.addWidget(transcript_group)
 
@@ -2856,6 +2888,30 @@ class VideoHighlighterGUI(QWidget):
                 return []
             return [s.strip() for s in text.split(",") if s.strip()]
 
+        # Advanced keyword scoring routes through the single merge choke point
+        # (R10): panel state only when it parsed clean and passes the persist
+        # gate; otherwise the on-disk subtree passes through verbatim, so the
+        # wholesale rewrite below can never drop the section (ui-section
+        # precedent). getattr guard: save can run before the tab is built.
+        panel = getattr(self, "advanced_scoring_panel", None)
+        if panel is not None:
+            advanced_scoring = resolve_section_for_save(
+                panel.current_model(),
+                ["unparsed section"] if panel.has_parse_error() else None,
+                self.config_data,
+            )
+            if (not panel.has_parse_error()
+                    and bool(panel.current_model().get("enabled", False))
+                    and not panel.is_gate_ok()):
+                # KTD3: enabled-and-invalid never blocks a save (or close) —
+                # but say that the last-valid on-disk section was kept.
+                self.append_log(
+                    "⚠️ Advanced keyword scoring: enabled with validation errors — "
+                    "keeping the last-valid section in config.yaml"
+                )
+        else:
+            advanced_scoring = resolve_section_for_save(None, None, self.config_data)
+
         data = {
             "video": {"paths": self.get_file_list()},
             "download": {
@@ -2908,6 +2964,7 @@ class VideoHighlighterGUI(QWidget):
             "keywords": {
                 "transcript_file": "transcript.txt",
                 "interesting": get_text_list(self.search_keywords_input),
+                "advanced_scoring": advanced_scoring,
             },
             "transcript": {
                 "enabled": self.transcript_checkbox.isChecked(),
@@ -2971,7 +3028,9 @@ class VideoHighlighterGUI(QWidget):
         """Handle transcript checkbox toggle"""
         self.transcript_source_lang.setEnabled(checked)
         self.transcript_model_combo.setEnabled(checked)
-        self.search_keywords_input.setEnabled(checked)
+        # R6: the simple list stays greyed while advanced scoring owns matching
+        advanced_on = bool(self.advanced_scoring_panel.current_model().get("enabled", False))
+        self.search_keywords_input.setEnabled(checked and not advanced_on)
         self.subtitles_checkbox.setEnabled(checked)
         
         # If transcript is disabled, also disable subtitles
@@ -2984,9 +3043,63 @@ class VideoHighlighterGUI(QWidget):
         # Subtitles can only be enabled if transcript is enabled
         transcript_enabled = self.transcript_checkbox.isChecked()
         final_state = checked and transcript_enabled
-        
+
         self.subtitle_source_lang.setEnabled(final_state)
         self.subtitle_target_lang.setEnabled(final_state)
+
+    def on_advanced_scoring_toggle(self, checked):
+        """Handle advanced-scoring master toggle (R6): while advanced owns
+        matching, grey out the simple search-keywords field and show the note."""
+        transcript_enabled = self.transcript_checkbox.isChecked()
+        self.search_keywords_input.setEnabled(transcript_enabled and not checked)
+        self.simple_keywords_note.setVisible(bool(checked))
+
+    def on_advanced_scoring_changed(self, section, gate_ok):
+        """Write-through persistence for keywords.advanced_scoring (R8).
+
+        Every committed panel edit lands here: if the persist gate passes
+        (toggle off, or enabled and valid), mirror the section into
+        config_data and write config.yaml immediately; if blocked, leave
+        memory and disk untouched — the panel already renders the errors."""
+        if gate_ok:
+            if not isinstance(self.config_data.get("keywords"), dict):
+                self.config_data["keywords"] = {}
+            self.config_data["keywords"]["advanced_scoring"] = section
+            self.save_config()
+        else:
+            errors = self.advanced_scoring_panel.current_errors()
+            self.append_log(
+                f"⚠️ Advanced keyword scoring: {len(errors)} validation error(s) — "
+                "config.yaml not updated (fix them or disable the toggle to save WIP)"
+            )
+
+    def on_import_simple_keywords(self):
+        """One-shot migration of the simple keyword list into a group (R11)."""
+        words = [s.strip() for s in self.search_keywords_input.text().split(",") if s.strip()]
+        if not words:
+            return
+        keyword_points = int(self.spin_keyword_points.value())
+        existing_ids = [g.get("id") for g in self.advanced_scoring_panel.current_model().get("groups") or []]
+        group = import_simple_keywords(words, keyword_points, existing_ids)
+        self.advanced_scoring_panel.add_group(group)
+        self.append_log(
+            f"✅ Imported {len(group['words'])} keyword(s) into group "
+            f"'{group['id']}' (weight {keyword_points})"
+        )
+
+    def refresh_import_button(self, _text=""):
+        """Import needs a non-empty simple keyword list (R11)."""
+        has_words = bool([s for s in self.search_keywords_input.text().split(",") if s.strip()])
+        if has_words:
+            self.advanced_scoring_panel.set_import_enabled(
+                True,
+                "Create a new group from the simple search-keywords list, "
+                "weighted at the current keyword points value.",
+            )
+        else:
+            self.advanced_scoring_panel.set_import_enabled(
+                False, "Simple search-keywords list is empty — nothing to import"
+            )
 
     # --- Labels ---
     def load_labels_from_json(self, filepath):
@@ -3535,7 +3648,23 @@ class VideoHighlighterGUI(QWidget):
         if self.worker and self.worker.isRunning():
             self.append_log("⚠️ Pipeline already running!")
             return
-        
+
+        # --- Advanced keyword scoring gate (R8/KTD3) ---
+        # Never start with an enabled-but-invalid section; this single check
+        # covers the Run button and auto_start_pipeline (both call here).
+        panel = getattr(self, "advanced_scoring_panel", None)
+        if (panel is not None
+                and bool(panel.current_model().get("enabled", False))
+                and not panel.is_gate_ok()):
+            errors = panel.current_errors()
+            self.append_log(
+                f"❌ Advanced keyword scoring has {len(errors)} validation error(s) — "
+                "fix them (or disable the toggle) before running:"
+            )
+            for error in errors:
+                self.append_log(f"  ⚠️ {error.get('message', error)}")
+            return
+
         # --- Validate scoring points ---
         scene_points = int(self.spin_scene_points.value())
         motion_event_points = int(self.spin_motion_event_points.value())
