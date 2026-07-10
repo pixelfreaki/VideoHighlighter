@@ -71,6 +71,14 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "range_start": range_start if use_time_range else 0,
         "range_end": range_end if use_time_range else None,
 
+        # scene/motion point settings gate whether the motion stage computes anything at
+        # all (all-zero means motion is skipped and cached as empty) -- must be part of
+        # the signature so a resumed run doesn't silently reuse an empty motion checkpoint
+        # after the user raises these from 0.
+        "scene_points": int(gui_config.get("scene_points", 0) or 0),
+        "motion_event_points": int(gui_config.get("motion_event_points", 0) or 0),
+        "motion_peak_points": int(gui_config.get("motion_peak_points", 0) or 0),
+
         # optional: points affect scoring, not analysis — but if you cache “analysis only”
         # you can omit scoring params. If you cache waveforms/peaks based on thresholds,
         # include them.
@@ -81,6 +89,35 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "freeze_factor": float(gui_config.get("freeze_factor", 0.8)),
     }
     return params
+
+
+# Pipeline stages this checkpoint/resume feature persists. trim, face_work,
+# score_computation, video_cutting, and subtitles have no existing skip
+# infrastructure and are out of scope (see the checkpoint/resume plan's
+# Scope Boundaries) -- they always run in full.
+CHECKPOINTED_STAGES: Tuple[str, ...] = (
+    "transcript", "motion", "audio_peaks", "object_detection", "action_detection",
+)
+
+
+def resolve_completed_stages(
+    cache_is_complete: bool,
+    on_disk_completed_stages: Optional[List[str]],
+    checkpointed_stages: Tuple[str, ...] = CHECKPOINTED_STAGES,
+) -> Tuple[set, bool]:
+    """Resume decision: given a matched cache lookup, which stages are already done?
+
+    A fully-complete cache (cache_is_complete=True) means every checkpointed stage is
+    done. A partial checkpoint's on_disk_completed_stages is intersected with the known
+    checkpointed stages defensively -- an unrecognized stage name on disk (e.g. from a
+    future version) is ignored rather than trusted.
+
+    Returns (completed_stages: set[str], full_cache_hit: bool).
+    """
+    if cache_is_complete:
+        return set(checkpointed_stages), True
+    stages = set(on_disk_completed_stages or []) & set(checkpointed_stages)
+    return stages, False
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
@@ -326,12 +363,23 @@ class VideoAnalysisCache:
                 return self._get_analysis_cache_path_for_signature(video_path, signature).exists()
             return self._get_cache_path(video_path).exists()
 
-    def save(self, video_path: str, analysis_data: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> None:
+    def save(
+        self,
+        video_path: str,
+        analysis_data: Dict[str, Any],
+        params: Optional[Dict[str, Any]] = None,
+        complete: bool = True,
+        completed_stages: Optional[List[str]] = None,
+    ) -> None:
         """
         Save analysis cache.
         - Atomic write (no partial cache)
         - If params provided: use signature-based filename so parameter changes create a new cache file
         - If params is None: fall back to legacy path (<video_hash>.cache.json) for backward compatibility
+        - complete=False marks this as an in-progress checkpoint (cache_complete: False) rather than
+          a fully-usable analysis cache; load() continues to reject these, load_partial() accepts them
+        - completed_stages: names of pipeline stages whose results are present in analysis_data so far;
+          only meaningful when complete=False (defaults preserve today's behavior for existing callers)
         """
         with self._lock:
             video_hash = self._get_video_hash(video_path)
@@ -348,63 +396,97 @@ class VideoAnalysisCache:
                 "video_hash": video_hash,
                 "cached_at": datetime.now().isoformat(),
                 "cache_version": "1.1",
-                "cache_complete": True,
+                "cache_complete": complete,
                 "analysis_signature": signature,
                 "analysis_parameters": params,
                 **analysis_data,
             }
+            if completed_stages is not None:
+                cache_data["completed_stages"] = list(completed_stages)
 
             atomic_write_json(cache_path, cache_data)
 
             self.stats["saves"] += 1
             print(f"✓ Cache saved: {cache_path}")
 
+    def _load_raw(
+        self, video_path: str, params: Optional[Dict[str, Any]] = None, verbose: bool = False
+    ) -> Tuple[Optional[Dict[str, Any]], Path]:
+        """
+        Read and validate the cache file for video_path/params, regardless of completeness.
+
+        Resolves the signature-based (or legacy) cache path, checks it exists, parses the
+        JSON, and validates the video-hash and (if params given) signature match. Returns
+        (cache_data, cache_path) on success or (None, cache_path) on any miss -- missing
+        file, hash mismatch, signature mismatch, or corrupt JSON. Shared by load() and
+        load_partial(), which layer their own completeness/stats/logging semantics on top.
+        """
+        if params is not None:
+            signature = self._make_signature(params)
+            cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
+        else:
+            signature = None
+            cache_path = self._get_cache_path(video_path)
+
+        if not cache_path.exists():
+            return None, cache_path
+
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+
+            current_hash = self._get_video_hash(video_path)
+            if cache_data.get("video_hash") != current_hash:
+                if verbose:
+                    print("⚠ Cache is outdated (video file changed), will re-process")
+                return None, cache_path
+
+            # Extra safety: if params were passed, ensure signature matches too
+            if params is not None and cache_data.get("analysis_signature") != signature:
+                return None, cache_path
+
+            return cache_data, cache_path
+
+        except (json.JSONDecodeError, KeyError) as e:
+            if verbose:
+                print(f"⚠ Cache file corrupted: {e}, will re-process")
+            return None, cache_path
+
     def load(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
         Load analysis cache.
         - If params provided: load signature-based cache (new cache per parameter change)
         - If params is None: fall back to legacy cache path
+        - Rejects incomplete (cache_complete is not True) caches -- use load_partial() for resume detection
         """
         with self._lock:
-            if params is not None:
-                signature = self._make_signature(params)
-                cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
-            else:
-                signature = None
-                cache_path = self._get_cache_path(video_path)
+            cache_data, cache_path = self._load_raw(video_path, params, verbose=True)
 
-            if not cache_path.exists():
+            if cache_data is None:
                 self.stats["misses"] += 1
                 return None
 
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cache_data = json.load(f)
-
-                current_hash = self._get_video_hash(video_path)
-                if cache_data.get("video_hash") != current_hash:
-                    print("⚠ Cache is outdated (video file changed), will re-process")
-                    self.stats["misses"] += 1
-                    return None
-
-                if cache_data.get("cache_complete") is not True:
-                    print("⚠ Cache incomplete, will re-process")
-                    self.stats["misses"] += 1
-                    return None
-
-                # Extra safety: if params were passed, ensure signature matches too
-                if params is not None and cache_data.get("analysis_signature") != signature:
-                    self.stats["misses"] += 1
-                    return None
-
-                print(f"✓ Cache loaded from: {cache_path}")
-                self.stats["hits"] += 1
-                return cache_data
-
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"⚠ Cache file corrupted: {e}, will re-process")
+            if cache_data.get("cache_complete") is not True:
+                print("⚠ Cache incomplete, will re-process")
                 self.stats["misses"] += 1
                 return None
+
+            print(f"✓ Cache loaded from: {cache_path}")
+            self.stats["hits"] += 1
+            return cache_data
+
+    def load_partial(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Load analysis cache for resume detection, regardless of completeness.
+
+        Mirrors load()'s hash/signature identity checks but skips the cache_complete
+        rejection, so an in-progress checkpoint (saved via save(complete=False, ...))
+        is returned too -- with whatever completed_stages and partial data is on disk.
+        Returns None on a hash/signature mismatch or missing/corrupt file.
+        """
+        with self._lock:
+            cache_data, _ = self._load_raw(video_path, params, verbose=False)
+            return cache_data
 
     # convenience aliases (optional usage in your pipeline)
     def save_enhanced(self, video_path: str, analysis_data: Dict[str, Any]) -> bool:
