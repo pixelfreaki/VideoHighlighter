@@ -71,6 +71,14 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "range_start": range_start if use_time_range else 0,
         "range_end": range_end if use_time_range else None,
 
+        # scene/motion point settings gate whether the motion stage computes anything at
+        # all (all-zero means motion is skipped and cached as empty) -- must be part of
+        # the signature so a resumed run doesn't silently reuse an empty motion checkpoint
+        # after the user raises these from 0.
+        "scene_points": int(gui_config.get("scene_points", 0) or 0),
+        "motion_event_points": int(gui_config.get("motion_event_points", 0) or 0),
+        "motion_peak_points": int(gui_config.get("motion_peak_points", 0) or 0),
+
         # optional: points affect scoring, not analysis — but if you cache “analysis only”
         # you can omit scoring params. If you cache waveforms/peaks based on thresholds,
         # include them.

@@ -723,17 +723,27 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             from a prior checkpoint) -- safe to call unconditionally after every stage.
             Never aborts the run on a save failure, matching ProgressTracker's established
             posture that instrumentation/persistence must never be the reason a run fails.
+
+            Also a no-op when force_reprocess is set: a forced run starts with an empty
+            completed_stages regardless of what's already on disk (KTD5), so writing
+            incremental checkpoints here would overwrite a signature-matched, possibly
+            more-complete prior checkpoint with a smaller one if this run is interrupted
+            before finishing. force_reprocess runs still persist via the final complete=True
+            save once the whole run succeeds, matching the pre-existing single-save-at-end
+            behavior for this case.
             """
-            if cache is None or stage_name in completed_stages:
+            if cache is None or force_reprocess or stage_name in completed_stages:
                 return
-            completed_stages.add(stage_name)
             try:
                 checkpoint_data, _ = _build_checkpoint_payload()
                 cache.save(
                     original_video_path, checkpoint_data, params=analysis_params,
                     complete=False,
-                    completed_stages=[s for s in CHECKPOINTED_STAGES if s in completed_stages],
+                    completed_stages=[s for s in CHECKPOINTED_STAGES if s in completed_stages] + [stage_name],
                 )
+                # Only mark the stage complete once its checkpoint is durably on disk --
+                # a save failure must not silently advance the in-memory resume state.
+                completed_stages.add(stage_name)
             except Exception as e:
                 log(f"⚠️ Failed to save checkpoint after '{stage_name}': {e}")
 
@@ -867,6 +877,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Transcript processing ---
         progress.start_stage("transcript")
+        transcript_ok = True
         if "transcript" not in completed_stages:
             # Original transcript processing code
             if USE_TRANSCRIPT:
@@ -903,6 +914,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 except Exception as e:
                     log(f"⚠ Transcript processing failed: {e}")
                     transcript_segments = []
+                    transcript_ok = False
 
                 if SEARCH_KEYWORDS and transcript_segments:
                     check_cancellation(cancel_flag, log, "keyword search")
@@ -940,7 +952,8 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             else:
                 keyword_matches = []
         progress.end_stage("transcript")
-        _checkpoint_stage("transcript")
+        if transcript_ok:
+            _checkpoint_stage("transcript")
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
@@ -948,6 +961,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
         progress.start_stage("motion")
+        motion_ok = True
         if "motion" not in completed_stages:
             progress.record_stage_device("motion", motion_device)
             progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
@@ -995,6 +1009,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"❌ Motion detection failed: {e}")
                     import traceback
                     log(f"Full error: {traceback.format_exc()}")
+                    motion_ok = False
 
                 # Add progress update after motion detection
                 progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} scenes, {len(motion_events)} events, {len(motion_peaks)} peaks")
@@ -1002,7 +1017,8 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             log("⏭️ Skipping motion (already completed)")
             progress.update_progress(25, 100, "Pipeline", "Loaded cached motion analysis")
         progress.end_stage("motion")
-        _checkpoint_stage("motion")
+        if motion_ok:
+            _checkpoint_stage("motion")
 
         check_cancellation(cancel_flag, log, "motion detection completion")
 
@@ -1366,6 +1382,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         interesting_actions = gui_config.get("interesting_actions", [])
 
         progress.start_stage("action_detection")
+        action_detection_ok = True
         if "action_detection" not in completed_stages and interesting_actions:
             try:
                 # Get action label settings
@@ -1539,6 +1556,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 import traceback
                 log(f"Full error: {traceback.format_exc()}")
                 action_detections = []
+                action_detection_ok = False
         elif "action_detection" in completed_stages:
             log("⏭️ Skipping action_detection (already completed)")
             # action_detections already loaded from cache - ensure it's in 5-element format

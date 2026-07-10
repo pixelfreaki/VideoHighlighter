@@ -15,6 +15,7 @@ import time
 from modules.video_cache import (
     VideoAnalysisCache,
     CHECKPOINTED_STAGES,
+    build_analysis_cache_params,
     resolve_completed_stages,
 )
 
@@ -229,3 +230,43 @@ def test_setting_outside_analysis_params_does_not_break_resume(tmp_path):
     assert result["completed_stages"] == [
         "transcript", "motion", "audio_peaks", "object_detection", "action_detection",
     ]
+
+
+# ---------------------------------------------------------------------------
+# scene/motion point-settings signature coverage (code-review fix: these gate
+# whether the checkpointed "motion" stage computes anything at all, so a
+# resume must not silently reuse an empty motion checkpoint after the user
+# raises them from 0)
+# ---------------------------------------------------------------------------
+
+def test_analysis_params_changes_when_motion_point_settings_change():
+    base_config = {"scene_points": 0, "motion_event_points": 0, "motion_peak_points": 0}
+    raised_config = {"scene_points": 5, "motion_event_points": 0, "motion_peak_points": 0}
+
+    base_params = build_analysis_cache_params(base_config, {}, sample_rate=5, video_duration=60.0)
+    raised_params = build_analysis_cache_params(raised_config, {}, sample_rate=5, video_duration=60.0)
+
+    assert base_params != raised_params
+    assert base_params["scene_points"] == 0
+    assert raised_params["scene_points"] == 5
+
+
+def test_motion_skipped_checkpoint_does_not_resume_under_raised_point_settings(tmp_path):
+    cache = _cache(tmp_path)
+    video_path = _make_video(tmp_path)
+
+    skipped_config = {"scene_points": 0, "motion_event_points": 0, "motion_peak_points": 0}
+    raised_config = {"scene_points": 5, "motion_event_points": 0, "motion_peak_points": 0}
+    params_skipped = build_analysis_cache_params(skipped_config, {}, sample_rate=5, video_duration=60.0)
+    params_raised = build_analysis_cache_params(raised_config, {}, sample_rate=5, video_duration=60.0)
+
+    cache.save(
+        video_path, {}, params=params_skipped, complete=False,
+        completed_stages=["transcript", "motion"],
+    )
+
+    # Raising the points settings must produce a different signature, so the
+    # empty-motion checkpoint saved under the old settings is invisible here --
+    # motion (and everything after it) reruns instead of silently resuming
+    # with stale empty data.
+    assert cache.load_partial(video_path, params=params_raised) is None
