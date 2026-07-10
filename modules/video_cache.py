@@ -83,6 +83,35 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
     return params
 
 
+# Pipeline stages this checkpoint/resume feature persists. trim, face_work,
+# score_computation, video_cutting, and subtitles have no existing skip
+# infrastructure and are out of scope (see the checkpoint/resume plan's
+# Scope Boundaries) -- they always run in full.
+CHECKPOINTED_STAGES: Tuple[str, ...] = (
+    "transcript", "motion", "audio_peaks", "object_detection", "action_detection",
+)
+
+
+def resolve_completed_stages(
+    cache_is_complete: bool,
+    on_disk_completed_stages: Optional[List[str]],
+    checkpointed_stages: Tuple[str, ...] = CHECKPOINTED_STAGES,
+) -> Tuple[set, bool]:
+    """Resume decision: given a matched cache lookup, which stages are already done?
+
+    A fully-complete cache (cache_is_complete=True) means every checkpointed stage is
+    done. A partial checkpoint's on_disk_completed_stages is intersected with the known
+    checkpointed stages defensively -- an unrecognized stage name on disk (e.g. from a
+    future version) is ignored rather than trusted.
+
+    Returns (completed_stages: set[str], full_cache_hit: bool).
+    """
+    if cache_is_complete:
+        return set(checkpointed_stages), True
+    stages = set(on_disk_completed_stages or []) & set(checkpointed_stages)
+    return stages, False
+
+
 def atomic_write_json(path: Path, data: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

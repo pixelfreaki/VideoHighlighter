@@ -10,7 +10,13 @@ sibling pattern applied to ProgressTracker).
 
 from __future__ import annotations
 
-from modules.video_cache import VideoAnalysisCache
+import time
+
+from modules.video_cache import (
+    VideoAnalysisCache,
+    CHECKPOINTED_STAGES,
+    resolve_completed_stages,
+)
 
 
 def _make_video(tmp_path, name="video.mp4", content=b"fake video bytes"):
@@ -92,3 +98,91 @@ def test_load_partial_reads_a_fully_complete_cache_too(tmp_path):
 
     assert result is not None
     assert result["cache_complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# resolve_completed_stages (U2/U4 resume-decision logic, tested in isolation
+# per the plan's U5 instruction rather than by driving _run_highlighter_impl)
+# ---------------------------------------------------------------------------
+
+def test_resolve_completed_stages_full_cache_hit_marks_every_checkpointed_stage():
+    completed, full_hit = resolve_completed_stages(cache_is_complete=True, on_disk_completed_stages=None)
+
+    assert full_hit is True
+    assert completed == set(CHECKPOINTED_STAGES)
+
+
+def test_resolve_completed_stages_partial_checkpoint_resumes_at_first_incomplete_stage():
+    # AE1: checkpointed through motion, interrupted mid-audio_peaks
+    completed, full_hit = resolve_completed_stages(
+        cache_is_complete=False, on_disk_completed_stages=["transcript", "motion"]
+    )
+
+    assert full_hit is False
+    assert completed == {"transcript", "motion"}
+    remaining = [s for s in CHECKPOINTED_STAGES if s not in completed]
+    assert remaining[0] == "audio_peaks"
+
+
+def test_resolve_completed_stages_ignores_unrecognized_stage_names():
+    # Defensive intersection: "trim" is never a checkpointed stage, and an
+    # unrecognized future stage name on disk should not be trusted blindly.
+    completed, full_hit = resolve_completed_stages(
+        cache_is_complete=False, on_disk_completed_stages=["trim", "transcript", "some_future_stage"]
+    )
+
+    assert full_hit is False
+    assert completed == {"transcript"}
+
+
+def test_resolve_completed_stages_with_no_on_disk_stages_resumes_nothing():
+    completed, full_hit = resolve_completed_stages(cache_is_complete=False, on_disk_completed_stages=None)
+
+    assert full_hit is False
+    assert completed == set()
+
+
+# ---------------------------------------------------------------------------
+# Time-range identity stability (KTD3 fix) and batch independence (KTD7)
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_identity_is_stable_across_a_simulated_re_trim(tmp_path):
+    """A checkpoint keyed on the ORIGINAL video must still resolve after the
+    re-trimmed temp file changes on disk -- re-trimming must never break resume
+    for use_time_range videos (AE3)."""
+    cache = _cache(tmp_path)
+    original_video = _make_video(tmp_path, name="source.mp4")
+    params = {"use_time_range": True, "range_start": 0, "range_end": 30}
+
+    cache.save(
+        original_video, {"transcript": {"segments": []}}, params=params,
+        complete=False, completed_stages=["transcript", "motion"],
+    )
+
+    # Simulate Cancel + re-trim: a *different* file (the temp trimmed video) is
+    # rewritten with a new mtime. The original source video is untouched.
+    trimmed_video = tmp_path / "source_temp_trimmed.mp4"
+    trimmed_video.write_bytes(b"first trim contents")
+    time.sleep(0.01)
+    trimmed_video.write_bytes(b"second trim contents, different mtime")
+
+    result = cache.load_partial(original_video, params=params)
+
+    assert result is not None
+    assert result["completed_stages"] == ["transcript", "motion"]
+
+
+def test_checkpoint_for_one_video_does_not_affect_anothers_resume_decision(tmp_path):
+    cache = _cache(tmp_path)
+    video_a = _make_video(tmp_path, name="a.mp4", content=b"video a")
+    video_b = _make_video(tmp_path, name="b.mp4", content=b"video b")
+    params = {"yolo_model_size": "n"}
+
+    cache.save(
+        video_a, {}, params=params, complete=False,
+        completed_stages=["transcript", "motion", "audio_peaks"],
+    )
+
+    assert cache.load_partial(video_b, params=params) is None
+    result_a = cache.load_partial(video_a, params=params)
+    assert result_a["completed_stages"] == ["transcript", "motion", "audio_peaks"]

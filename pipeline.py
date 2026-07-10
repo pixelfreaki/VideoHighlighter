@@ -17,7 +17,10 @@ from object_recognition import run_object_detection_single
 # modules
 from modules.audio_peaks import extract_audio_peaks
 from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
-from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules.video_cache import (
+    VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params,
+    CHECKPOINTED_STAGES, resolve_completed_stages,
+)
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
 from modules.device_utils import resolve_yolo_device, detect_best_device, should_export_yolo_to_openvino
@@ -643,6 +646,11 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         # - Use VideoAnalysisCache signature-based files via load(..., params=analysis_params)
         # - Maintain backward compatibility
         # - Ensure timeline viewer gets all necessary data
+        # - Checkpoint/resume: identity is keyed on original_video_path, not processed_video_path,
+        #   so a use_time_range re-trim (fresh mtime every run) never breaks resume (plan KTD3).
+        #   A fully-complete cache marks every checkpointed stage done; a partial checkpoint
+        #   (cache_complete: False) marks only the stages recorded in completed_stages, and the
+        #   remaining stages below run and self-checkpoint via _checkpoint_stage() (KTD1-KTD4).
 
         # Build analysis parameters that affect cache signature
         analysis_params = build_analysis_cache_params(
@@ -665,17 +673,71 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         motion_peaks = []
         audio_peaks = []
         waveform_data = None  # For timeline viewer
-        using_cache = False
+        object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
+        action_bboxes_cache = []
+        all_action_detections = []  # full raw detection stream (for the timeline "show all")
+
+        # Per-stage resume state. CHECKPOINTED_STAGES (modules/video_cache.py) is this
+        # feature's checkpoint scope -- trim/face_work/score_computation/video_cutting/
+        # subtitles are out of scope (see plan Scope Boundaries) and always run in full.
+        completed_stages = set()
+        full_cache_hit = False
+
+        cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache")) if use_cache else None
+
+        def _checkpoint_stage(stage_name):
+            """Persist progress durably right after a checkpointed stage completes.
+
+            No-op if caching is disabled or the stage was already complete (e.g. resumed
+            from a prior checkpoint) -- safe to call unconditionally after every stage.
+            Never aborts the run on a save failure, matching ProgressTracker's established
+            posture that instrumentation/persistence must never be the reason a run fails.
+            """
+            if cache is None or stage_name in completed_stages:
+                return
+            completed_stages.add(stage_name)
+            try:
+                keyword_segments_only = bool(SEARCH_KEYWORDS and USE_TRANSCRIPT)
+                checkpoint_data = collect_analysis_data(
+                    video_path=processed_video_path,
+                    video_duration=float(video_duration),
+                    fps=float(fps),
+                    transcript_segments=transcript_segments,
+                    object_detections=object_detections,
+                    action_detections=action_detections,
+                    action_detections_all=all_action_detections,
+                    scenes=scenes,
+                    motion_events=[float(t) for t in motion_events],
+                    motion_peaks=[float(t) for t in motion_peaks],
+                    audio_peaks=[float(t) for t in audio_peaks],
+                    source_lang=TRANSCRIPT_SOURCE_LANG,
+                    waveform_data=waveform_data,
+                    keyword_segments_only=keyword_segments_only,
+                    search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
+                    keyword_matches=keyword_matches,
+                    action_bboxes=action_bboxes_cache,
+                    object_bboxes=object_bboxes_cache,
+                )
+                checkpoint_data["analysis_parameters"] = analysis_params
+                cache.save(
+                    original_video_path, checkpoint_data, params=analysis_params,
+                    complete=False,
+                    completed_stages=[s for s in CHECKPOINTED_STAGES if s in completed_stages],
+                )
+            except Exception as e:
+                log(f"⚠️ Failed to save checkpoint after '{stage_name}': {e}")
 
         # Try to load from cache if enabled
         if use_cache and not force_reprocess:
-            cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
             try:
                 start_time_cache = time.time()
-                # Use signature-based loading
-                cached_data = cache.load(processed_video_path, params=analysis_params)
+                # Prefer a fully-complete cache; fall back to a partial checkpoint for resume
+                cached_data = cache.load(original_video_path, params=analysis_params)
+                cache_is_complete = cached_data is not None
+                if cached_data is None:
+                    cached_data = cache.load_partial(original_video_path, params=analysis_params)
                 load_time = time.time() - start_time_cache
-                
+
                 if cached_data:
                     # Verify it's for the same video (check duration, etc.)
                     cache_video_duration = cached_data.get("video_metadata", {}).get("duration", 0)
@@ -684,13 +746,13 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                         cache_keyword_filtered = cached_data.get("transcript", {}).get("keyword_filtered", False)
                         cache_search_keywords = cached_data.get("cache_flags", {}).get("search_keywords", [])
                         cache_language = cached_data.get("transcript", {}).get("language", "en")  # Add this line
-                        
+
                         # We can use cached data if:
                         # 1. We don't need transcript at all (not using transcript)
                         # 2. Cache has full transcript and we need full transcript
                         # 3. Cache has keyword-filtered transcript and we need keyword-filtered with same keywords
                         current_keywords = SEARCH_KEYWORDS if USE_TRANSCRIPT else []
-                        
+
                         cache_compatible = False
                         if not USE_TRANSCRIPT:
                             cache_compatible = True
@@ -708,18 +770,21 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                                 cache_compatible = True
                             else:
                                 log(f"⚠️ Cache incompatible: language mismatch or keywords not matching")
-                        
+
                         if cache_compatible:
                             log(f"✅ Loaded from cache ({load_time:.2f}s) [signature match]")
-                            
+
                             # Extract data from cache - Ensure all data is loaded
                             transcript_segments = cached_data.get("transcript", {}).get("segments", [])
                             object_detections_raw = cached_data.get("objects", [])
                             action_detections_raw = cached_data.get("actions", [])
+                            all_action_detections_raw = cached_data.get("actions_all", [])
                             scenes_raw = cached_data.get("scenes", [])
                             motion_events = cached_data.get("motion_events", [])
                             motion_peaks = cached_data.get("motion_peaks", [])
                             keyword_matches = cached_data.get("keyword_matches", [])
+                            object_bboxes_cache = cached_data.get("object_bboxes", []) or []
+                            action_bboxes_cache = cached_data.get("action_bboxes", []) or []
 
 
                             # Get audio data - handle both new and old formats
@@ -731,39 +796,55 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                                 # Legacy format
                                 audio_peaks = cached_data.get("audio_peaks", [])
                                 waveform_data = cached_data.get("waveform") or cached_data.get("waveform_data")
-                            
+
                             # Convert to pipeline format
                             object_detections = {}
                             for obj in object_detections_raw:
                                 sec = int(obj.get("timestamp", 0))
                                 object_detections[sec] = obj.get("objects", [])
-                            
+
                             # Convert action detections to proper format
-                            action_detections = []
-                            if action_detections_raw:
-                                for action in action_detections_raw:
+                            def _cached_actions_to_tuples(raw_actions):
+                                out = []
+                                for action in raw_actions or []:
                                     # Handle both 5-element and 6-element formats
                                     if len(action) >= 5:
-                                        action_detections.append((
+                                        out.append((
                                             action.get("timestamp", 0),
                                             action.get("frame_id", 0),
                                             action.get("action_id", -1),
                                             action.get("confidence", 0),
                                             action.get("action_name", "")
                                         ))
-                            
+                                return out
+
+                            action_detections = _cached_actions_to_tuples(action_detections_raw)
+                            all_action_detections = (
+                                _cached_actions_to_tuples(all_action_detections_raw)
+                                if all_action_detections_raw else action_detections
+                            )
+
                             scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
-                            
+
                             # Extract keyword matches from cache
                             keyword_matches = cached_data.get("keyword_matches", [])
 
-                            # Mark that we're using cached data
-                            using_cache = True
                             cache_status = "full" if not cache_keyword_filtered else f"keyword-filtered ({len(cache_search_keywords or [])} keywords)"
-                            log(f"✅ Loaded from cache: {len(transcript_segments)} transcript segments ({cache_status}), "
-                                f"{len(object_detections)} object seconds, {len(action_detections)} actions, "
-                                f"{len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks, "
-                                f"{len(audio_peaks)} audio peaks")
+                            completed_stages, full_cache_hit = resolve_completed_stages(
+                                cache_is_complete, cached_data.get("completed_stages")
+                            )
+                            if full_cache_hit:
+                                log(f"✅ Loaded from cache: {len(transcript_segments)} transcript segments ({cache_status}), "
+                                    f"{len(object_detections)} object seconds, {len(action_detections)} actions, "
+                                    f"{len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks, "
+                                    f"{len(audio_peaks)} audio peaks")
+                            else:
+                                skip_order = [s for s in CHECKPOINTED_STAGES if s in completed_stages]
+                                remaining = next((s for s in CHECKPOINTED_STAGES if s not in completed_stages), None)
+                                if skip_order:
+                                    log(f"⏩ Resuming from checkpoint ({cache_status}): "
+                                        f"{', '.join(skip_order)} already completed" +
+                                        (f", resuming at '{remaining}'" if remaining else " (all stages done)"))
                         else:
                             log(f"⚠️ Cache incompatible: cached with {'keyword-filtered' if cache_keyword_filtered else 'full'} transcript, "
                                 f"need {'keyword-filtered' if current_keywords else 'full'} transcript")
@@ -776,14 +857,11 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 cached_data = None
         else:
             log("ℹ️ Cache disabled or forced reprocess")
-
-        # Ensure using_cache is properly set
-        using_cache = 'cached_data' in locals() and cached_data is not None
         # ========== END CACHE CHECK ==========
 
         # --- Transcript processing ---
         progress.start_stage("transcript")
-        if not using_cache:
+        if "transcript" not in completed_stages:
             # Original transcript processing code
             if USE_TRANSCRIPT:
                 # Predicted device: transcript.py/speaker_utils.py resolve their own
@@ -845,9 +923,9 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     keyword_matches = []
 
         else:
-            log("ℹ️ Using cached transcript")
+            log("⏭️ Skipping transcript (already completed)")
             # transcript_segments already loaded from cache
-            
+
             # 🆕 ADD THIS BLOCK - Re-run keyword search on cached transcript
             if SEARCH_KEYWORDS and transcript_segments:
                 log(f"🔹 Searching cached transcript for keywords: {SEARCH_KEYWORDS}")
@@ -856,6 +934,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             else:
                 keyword_matches = []
         progress.end_stage("transcript")
+        _checkpoint_stage("transcript")
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
@@ -863,7 +942,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
         progress.start_stage("motion")
-        if not using_cache:
+        if "motion" not in completed_stages:
             progress.record_stage_device("motion", motion_device)
             progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
             
@@ -914,9 +993,10 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 # Add progress update after motion detection
                 progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} scenes, {len(motion_events)} events, {len(motion_peaks)} peaks")
         else:
-            log("ℹ️ Using cached motion analysis")
+            log("⏭️ Skipping motion (already completed)")
             progress.update_progress(25, 100, "Pipeline", "Loaded cached motion analysis")
         progress.end_stage("motion")
+        _checkpoint_stage("motion")
 
         check_cancellation(cancel_flag, log, "motion detection completion")
 
@@ -948,8 +1028,8 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             # Legacy layout: top-level "audio_peaks"
             return cached.get("audio_peaks") or []
 
-        if using_cache:
-            log("ℹ️ Using cached audio data")
+        if "audio_peaks" in completed_stages:
+            log("⏭️ Skipping audio_peaks (already completed)")
             audio_peaks = _get_cached_audio_peaks(cached_data)
             waveform_data = _get_cached_waveform(cached_data)
 
@@ -999,6 +1079,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 except RuntimeError:
                     return None
         progress.end_stage("audio_peaks")
+        _checkpoint_stage("audio_peaks")
 
         # 4 Object detection setup
         progress.start_stage("object_detection")
@@ -1100,8 +1181,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             yolo_model = None
 
         # --- Object detection ---
-        object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
-        if not using_cache:
+        if "object_detection" not in completed_stages:
             if not highlight_objects:
                 log("ℹ Skipping object detection (no objects to highlight)")
                 object_detections = {}
@@ -1207,8 +1287,9 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"⚠️ Composition engine skipped: {_ce}")
 
         else:
-            log("ℹ️ Using cached object detections")
+            log("⏭️ Skipping object_detection (already completed)")
         progress.end_stage("object_detection")
+        _checkpoint_stage("object_detection")
 
         print("Detections per second:", len(object_detections))
 
@@ -1277,11 +1358,9 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Action recognition with grouping ---
         interesting_actions = gui_config.get("interesting_actions", [])
-        action_bboxes_cache = []
-        all_action_detections = []  # full raw detection stream (for the timeline "show all")
 
         progress.start_stage("action_detection")
-        if not using_cache and interesting_actions:
+        if "action_detection" not in completed_stages and interesting_actions:
             try:
                 # Get action label settings
                 draw_action_labels = gui_config.get("draw_action_labels", False)
@@ -1454,8 +1533,8 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 import traceback
                 log(f"Full error: {traceback.format_exc()}")
                 action_detections = []
-        elif using_cache:
-            log("ℹ️ Using cached action detections")
+        elif "action_detection" in completed_stages:
+            log("⏭️ Skipping action_detection (already completed)")
             # action_detections already loaded from cache - ensure it's in 5-element format
             if action_detections and len(action_detections) > 0:
                 first_det = action_detections[0]
@@ -1470,13 +1549,14 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
             log("ℹ️ No interesting actions specified, skipping action recognition")
             action_detections = []
         progress.end_stage("action_detection")
+        _checkpoint_stage("action_detection")
 
-        # ========== SAVE TO CACHE IF NOT USING CACHE ==========
-        if not using_cache and use_cache and not (cancel_flag and cancel_flag.is_set()):
+        # ========== SAVE FINAL COMPLETE CACHE (unless this was already a full cache hit) ==========
+        if not full_cache_hit and use_cache and not (cancel_flag and cancel_flag.is_set()):
             try:
                 # Determine if we should cache only keyword segments
                 keyword_segments_only = bool(SEARCH_KEYWORDS and USE_TRANSCRIPT)
-                
+
                 # Collect analysis data with keyword filtering if needed
                 analysis_data = collect_analysis_data(
                     video_path=processed_video_path,
@@ -1498,19 +1578,21 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                     action_bboxes=action_bboxes_cache,
                     object_bboxes=object_bboxes_cache,
                 )
-                
+
                 # Add analysis parameters for future validation
                 analysis_data["analysis_parameters"] = analysis_params
-                
-                # Save to cache with signature-based naming
-                cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
-                cache.save(processed_video_path, analysis_data, params=analysis_params)
-                
+
+                # Save to cache with signature-based naming, marked fully complete
+                cache.save(
+                    original_video_path, analysis_data, params=analysis_params,
+                    complete=True, completed_stages=list(CHECKPOINTED_STAGES),
+                )
+
                 if keyword_segments_only:
                     log(f"✅ Analysis results cached (keyword-filtered: {len(analysis_data['transcript']['segments'])} segments, language: {TRANSCRIPT_SOURCE_LANG})")
                 else:
                     log(f"✅ Analysis results cached (full transcript: {len(analysis_data['transcript']['segments'])} segments, language: {TRANSCRIPT_SOURCE_LANG})")
-                
+
             except Exception as e:
                 log(f"⚠️ Failed to save cache: {e}")
                 import traceback
