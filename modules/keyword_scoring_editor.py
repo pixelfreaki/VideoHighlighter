@@ -5,7 +5,7 @@ Pure editor model for the Advanced Keyword Scoring GUI.
 All non-Qt logic behind the keywords.advanced_scoring editor panel (see
 docs/plans/2026-07-10-004-feat-advanced-scoring-gui-plan.md, unit U2):
 defensive parse, YAML-ready serialization, the simple-keywords import
-transform, the new-group factory, reorder, reset, the persist-gate decision,
+transform, the new-group factory, reset, the persist-gate decision,
 and the single save-merge choke point resolve_section_for_save().
 
 Zero heavy dependencies -- stdlib only -- so this module is directly
