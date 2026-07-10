@@ -270,3 +270,97 @@ def test_motion_skipped_checkpoint_does_not_resume_under_raised_point_settings(t
     # motion (and everything after it) reruns instead of silently resuming
     # with stale empty data.
     assert cache.load_partial(video_path, params=params_raised) is None
+
+
+# ---------------------------------------------------------------------------
+# Advanced keyword scoring signature coverage (U2) -- match-affecting settings
+# only, weight excluded (KTD5)
+# ---------------------------------------------------------------------------
+
+def _advanced_scoring_config(**overrides):
+    config = {
+        "enabled": True,
+        "prevent_overlapping_matches": True,
+        "cooldown_seconds": 5,
+        "normalization": {"lowercase": True, "remove_accents": True,
+                           "remove_punctuation": True, "collapse_whitespace": True},
+        "groups": [{"id": "panic", "weight": 15, "words": ["vou morrer"]}],
+    }
+    config.update(overrides)
+    return config
+
+
+def test_advanced_scoring_enabled_flag_changes_signature():
+    disabled = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(enabled=False)}},
+        sample_rate=5, video_duration=60.0,
+    )
+    enabled = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(enabled=True)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert disabled != enabled
+
+
+def test_advanced_scoring_word_list_change_changes_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config()}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed_words = _advanced_scoring_config()
+    changed_words["groups"][0]["words"] = ["morri"]
+    other = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": changed_words}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base != other
+
+
+def test_advanced_scoring_weight_only_change_does_not_change_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config()}},
+        sample_rate=5, video_duration=60.0,
+    )
+    changed_weight = _advanced_scoring_config()
+    changed_weight["groups"][0]["weight"] = 999
+    other = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": changed_weight}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base == other
+
+
+def test_advanced_scoring_yaml_reordering_does_not_change_signature():
+    base = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(
+            groups=[
+                {"id": "reaction", "weight": 6, "words": ["caraca", "bugou"]},
+                {"id": "panic", "weight": 15, "words": ["vou morrer"]},
+            ],
+        )}},
+        sample_rate=5, video_duration=60.0,
+    )
+    reordered = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(
+            groups=[
+                {"id": "panic", "weight": 15, "words": ["vou morrer"]},
+                {"id": "reaction", "weight": 6, "words": ["bugou", "caraca"]},
+            ],
+        )}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert base == reordered
+
+
+def test_advanced_scoring_absent_and_explicitly_disabled_produce_same_signature():
+    absent = build_analysis_cache_params({}, {}, sample_rate=5, video_duration=60.0)
+    disabled_with_leftover_groups = build_analysis_cache_params(
+        {}, {"keywords": {"advanced_scoring": _advanced_scoring_config(enabled=False)}},
+        sample_rate=5, video_duration=60.0,
+    )
+
+    assert absent["advanced_scoring"] == disabled_with_leftover_groups["advanced_scoring"]
