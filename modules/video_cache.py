@@ -401,6 +401,49 @@ class VideoAnalysisCache:
             self.stats["saves"] += 1
             print(f"✓ Cache saved: {cache_path}")
 
+    def _load_raw(
+        self, video_path: str, params: Optional[Dict[str, Any]] = None, verbose: bool = False
+    ) -> Tuple[Optional[Dict[str, Any]], Path]:
+        """
+        Read and validate the cache file for video_path/params, regardless of completeness.
+
+        Resolves the signature-based (or legacy) cache path, checks it exists, parses the
+        JSON, and validates the video-hash and (if params given) signature match. Returns
+        (cache_data, cache_path) on success or (None, cache_path) on any miss -- missing
+        file, hash mismatch, signature mismatch, or corrupt JSON. Shared by load() and
+        load_partial(), which layer their own completeness/stats/logging semantics on top.
+        """
+        if params is not None:
+            signature = self._make_signature(params)
+            cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
+        else:
+            signature = None
+            cache_path = self._get_cache_path(video_path)
+
+        if not cache_path.exists():
+            return None, cache_path
+
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+
+            current_hash = self._get_video_hash(video_path)
+            if cache_data.get("video_hash") != current_hash:
+                if verbose:
+                    print("⚠ Cache is outdated (video file changed), will re-process")
+                return None, cache_path
+
+            # Extra safety: if params were passed, ensure signature matches too
+            if params is not None and cache_data.get("analysis_signature") != signature:
+                return None, cache_path
+
+            return cache_data, cache_path
+
+        except (json.JSONDecodeError, KeyError) as e:
+            if verbose:
+                print(f"⚠ Cache file corrupted: {e}, will re-process")
+            return None, cache_path
+
     def load(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
         Load analysis cache.
@@ -409,45 +452,20 @@ class VideoAnalysisCache:
         - Rejects incomplete (cache_complete is not True) caches -- use load_partial() for resume detection
         """
         with self._lock:
-            if params is not None:
-                signature = self._make_signature(params)
-                cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
-            else:
-                signature = None
-                cache_path = self._get_cache_path(video_path)
+            cache_data, cache_path = self._load_raw(video_path, params, verbose=True)
 
-            if not cache_path.exists():
+            if cache_data is None:
                 self.stats["misses"] += 1
                 return None
 
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cache_data = json.load(f)
-
-                current_hash = self._get_video_hash(video_path)
-                if cache_data.get("video_hash") != current_hash:
-                    print("⚠ Cache is outdated (video file changed), will re-process")
-                    self.stats["misses"] += 1
-                    return None
-
-                if cache_data.get("cache_complete") is not True:
-                    print("⚠ Cache incomplete, will re-process")
-                    self.stats["misses"] += 1
-                    return None
-
-                # Extra safety: if params were passed, ensure signature matches too
-                if params is not None and cache_data.get("analysis_signature") != signature:
-                    self.stats["misses"] += 1
-                    return None
-
-                print(f"✓ Cache loaded from: {cache_path}")
-                self.stats["hits"] += 1
-                return cache_data
-
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"⚠ Cache file corrupted: {e}, will re-process")
+            if cache_data.get("cache_complete") is not True:
+                print("⚠ Cache incomplete, will re-process")
                 self.stats["misses"] += 1
                 return None
+
+            print(f"✓ Cache loaded from: {cache_path}")
+            self.stats["hits"] += 1
+            return cache_data
 
     def load_partial(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -459,31 +477,8 @@ class VideoAnalysisCache:
         Returns None on a hash/signature mismatch or missing/corrupt file.
         """
         with self._lock:
-            if params is not None:
-                signature = self._make_signature(params)
-                cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
-            else:
-                signature = None
-                cache_path = self._get_cache_path(video_path)
-
-            if not cache_path.exists():
-                return None
-
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cache_data = json.load(f)
-
-                current_hash = self._get_video_hash(video_path)
-                if cache_data.get("video_hash") != current_hash:
-                    return None
-
-                if params is not None and cache_data.get("analysis_signature") != signature:
-                    return None
-
-                return cache_data
-
-            except (json.JSONDecodeError, KeyError):
-                return None
+            cache_data, _ = self._load_raw(video_path, params, verbose=False)
+            return cache_data
 
     # convenience aliases (optional usage in your pipeline)
     def save_enhanced(self, video_path: str, analysis_data: Dict[str, Any]) -> bool:

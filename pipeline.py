@@ -685,6 +685,37 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache")) if use_cache else None
 
+        def _build_checkpoint_payload():
+            """Assemble the current in-memory analysis results into a cache-ready dict.
+
+            Shared by _checkpoint_stage() (per-stage, complete=False) and the final
+            complete=True save -- both persist the same shape, just at different points
+            and with a different `complete`/`completed_stages` combination.
+            """
+            keyword_segments_only = bool(SEARCH_KEYWORDS and USE_TRANSCRIPT)
+            payload = collect_analysis_data(
+                video_path=processed_video_path,
+                video_duration=float(video_duration),
+                fps=float(fps),
+                transcript_segments=transcript_segments,
+                object_detections=object_detections,
+                action_detections=action_detections,
+                action_detections_all=all_action_detections,
+                scenes=scenes,
+                motion_events=[float(t) for t in motion_events],
+                motion_peaks=[float(t) for t in motion_peaks],
+                audio_peaks=[float(t) for t in audio_peaks],
+                source_lang=TRANSCRIPT_SOURCE_LANG,
+                waveform_data=waveform_data,
+                keyword_segments_only=keyword_segments_only,
+                search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
+                keyword_matches=keyword_matches,
+                action_bboxes=action_bboxes_cache,
+                object_bboxes=object_bboxes_cache,
+            )
+            payload["analysis_parameters"] = analysis_params
+            return payload, keyword_segments_only
+
         def _checkpoint_stage(stage_name):
             """Persist progress durably right after a checkpointed stage completes.
 
@@ -697,28 +728,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 return
             completed_stages.add(stage_name)
             try:
-                keyword_segments_only = bool(SEARCH_KEYWORDS and USE_TRANSCRIPT)
-                checkpoint_data = collect_analysis_data(
-                    video_path=processed_video_path,
-                    video_duration=float(video_duration),
-                    fps=float(fps),
-                    transcript_segments=transcript_segments,
-                    object_detections=object_detections,
-                    action_detections=action_detections,
-                    action_detections_all=all_action_detections,
-                    scenes=scenes,
-                    motion_events=[float(t) for t in motion_events],
-                    motion_peaks=[float(t) for t in motion_peaks],
-                    audio_peaks=[float(t) for t in audio_peaks],
-                    source_lang=TRANSCRIPT_SOURCE_LANG,
-                    waveform_data=waveform_data,
-                    keyword_segments_only=keyword_segments_only,
-                    search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
-                    keyword_matches=keyword_matches,
-                    action_bboxes=action_bboxes_cache,
-                    object_bboxes=object_bboxes_cache,
-                )
-                checkpoint_data["analysis_parameters"] = analysis_params
+                checkpoint_data, _ = _build_checkpoint_payload()
                 cache.save(
                     original_video_path, checkpoint_data, params=analysis_params,
                     complete=False,
@@ -731,11 +741,11 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         if use_cache and not force_reprocess:
             try:
                 start_time_cache = time.time()
-                # Prefer a fully-complete cache; fall back to a partial checkpoint for resume
-                cached_data = cache.load(original_video_path, params=analysis_params)
-                cache_is_complete = cached_data is not None
-                if cached_data is None:
-                    cached_data = cache.load_partial(original_video_path, params=analysis_params)
+                # load_partial() returns a match regardless of completeness, so one read
+                # covers both the full-cache-hit and resume cases (no need to also call
+                # load(), which would re-read and re-hash the same file on a partial hit).
+                cached_data = cache.load_partial(original_video_path, params=analysis_params)
+                cache_is_complete = bool(cached_data) and cached_data.get("cache_complete") is True
                 load_time = time.time() - start_time_cache
 
                 if cached_data:
@@ -786,7 +796,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                             object_bboxes_cache = cached_data.get("object_bboxes", []) or []
                             action_bboxes_cache = cached_data.get("action_bboxes", []) or []
 
-
                             # Get audio data - handle both new and old formats
                             audio_block = cached_data.get("audio") or {}
                             if isinstance(audio_block, dict) and "peaks" in audio_block:
@@ -825,9 +834,6 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                             )
 
                             scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
-
-                            # Extract keyword matches from cache
-                            keyword_matches = cached_data.get("keyword_matches", [])
 
                             cache_status = "full" if not cache_keyword_filtered else f"keyword-filtered ({len(cache_search_keywords or [])} keywords)"
                             completed_stages, full_cache_hit = resolve_completed_stages(
@@ -1554,33 +1560,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         # ========== SAVE FINAL COMPLETE CACHE (unless this was already a full cache hit) ==========
         if not full_cache_hit and use_cache and not (cancel_flag and cancel_flag.is_set()):
             try:
-                # Determine if we should cache only keyword segments
-                keyword_segments_only = bool(SEARCH_KEYWORDS and USE_TRANSCRIPT)
-
-                # Collect analysis data with keyword filtering if needed
-                analysis_data = collect_analysis_data(
-                    video_path=processed_video_path,
-                    video_duration=float(video_duration),  # Ensure float
-                    fps=float(fps),  # Ensure float
-                    transcript_segments=transcript_segments,
-                    object_detections=object_detections,
-                    action_detections=action_detections,
-                    action_detections_all=all_action_detections,
-                    scenes=scenes,
-                    motion_events=[float(t) for t in motion_events],  # Convert numpy floats
-                    motion_peaks=[float(t) for t in motion_peaks],  # Convert numpy floats
-                    audio_peaks=[float(t) for t in audio_peaks],  # Convert numpy floats
-                    source_lang=TRANSCRIPT_SOURCE_LANG,
-                    waveform_data=waveform_data,
-                    keyword_segments_only=keyword_segments_only,
-                    search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
-                    keyword_matches=keyword_matches,
-                    action_bboxes=action_bboxes_cache,
-                    object_bboxes=object_bboxes_cache,
-                )
-
-                # Add analysis parameters for future validation
-                analysis_data["analysis_parameters"] = analysis_params
+                analysis_data, keyword_segments_only = _build_checkpoint_payload()
 
                 # Save to cache with signature-based naming, marked fully complete
                 cache.save(
