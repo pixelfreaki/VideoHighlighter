@@ -140,6 +140,18 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         # run never reuses a checkpoint whose matches came from different settings.
         "advanced_scoring": _advanced_scoring_signature(advanced_scoring),
     }
+
+    # Custom-detector identity: which model produced the object detections.
+    # Included only when a custom detector is active -- the cache signature
+    # hashes this whole dict, so standard-mode params must serialize
+    # byte-identically to the pre-custom shape or every existing cache file
+    # would be invalidated for users who never touch custom models.
+    yolo_type = str(gui_config.get("yolo_type") or "standard")
+    if "custom" in yolo_type:
+        params["yolo_type"] = yolo_type
+        params["yolo_custom_model_path"] = str(
+            gui_config.get("yolo_custom_model_path") or "")
+
     return params
 
 

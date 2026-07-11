@@ -1448,13 +1448,23 @@ class VideoHighlighterGUI(QWidget):
 
         self.yolo_type_combo = QComboBox()
         self.yolo_type_combo.addItem("Standard YOLOX (80 objects, fast, OpenVINO support)", "standard")
-
-        # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
-        self._custom_pose_model = None
+        self.yolo_type_combo.addItem("Custom model (trained detector)", "custom")
 
         current_type = advanced_cfg.get("yolo_type", "standard")
         idx_type = self.yolo_type_combo.findData(current_type)
         self.yolo_type_combo.setCurrentIndex(idx_type if idx_type >= 0 else 0)
+
+        # Custom detector path (train one with training/train_object.py).
+        # Enabled only in custom mode; empty text means "unset" and coerces to
+        # None in _custom_model_path() so the gui_config None-strip drops it.
+        self.custom_model_input = QLineEdit()
+        self.custom_model_input.setPlaceholderText("Path to trained best.pt...")
+        self.custom_model_input.setText(str(advanced_cfg.get("yolo_custom_model_path") or ""))
+        self.browse_custom_model_btn = QPushButton("Browse...")
+        self.browse_custom_model_btn.clicked.connect(self.browse_custom_model)
+        custom_model_row = QHBoxLayout()
+        custom_model_row.addWidget(self.custom_model_input)
+        custom_model_row.addWidget(self.browse_custom_model_btn)
 
         self.yolo_model_combo = QComboBox()
 
@@ -1467,8 +1477,12 @@ class VideoHighlighterGUI(QWidget):
             custom_only = (yolo_type == "custom")
 
             if custom_only:
-                # Size applies to the object detector, which isn't used here
-                self.yolo_model_combo.addItem("(custom model — size N/A)", "n")
+                # Size applies to the object detector, which isn't used here.
+                # The placeholder carries the previously selected size so a
+                # config save in custom mode round-trips yolo_model_size
+                # unchanged and standard mode restores the user's choice.
+                kept_size = prev_size or advanced_cfg.get("yolo_model_size", "n")
+                self.yolo_model_combo.addItem("(custom model — size N/A)", kept_size)
                 self.yolo_model_combo.setEnabled(False)
             else:
                 self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
@@ -1482,6 +1496,9 @@ class VideoHighlighterGUI(QWidget):
             if restore_idx >= 0:
                 self.yolo_model_combo.setCurrentIndex(restore_idx)
             self.yolo_model_combo.blockSignals(False)
+
+            self.custom_model_input.setEnabled(custom_only)
+            self.browse_custom_model_btn.setEnabled(custom_only)
 
         self.yolo_type_combo.currentIndexChanged.connect(on_yolo_type_changed)
 
@@ -1498,6 +1515,7 @@ class VideoHighlighterGUI(QWidget):
 
         object_layout.addRow("Frame skip:", self.obj_frame_skip_spin)
         object_layout.addRow("Detector type:", self.yolo_type_combo)
+        object_layout.addRow("Custom model:", custom_model_row)
         object_layout.addRow("Detector model size:", self.yolo_model_combo)
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
 
@@ -2420,7 +2438,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": self._custom_model_path(),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
@@ -2991,6 +3009,7 @@ class VideoHighlighterGUI(QWidget):
                 "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_type": self.yolo_type_combo.currentData(),
                 "yolo_model_size": self.yolo_model_combo.currentData(),
+                "yolo_custom_model_path": self._custom_model_path(),
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
                 "action_models": self.action_models_combo.currentData(),
@@ -3147,6 +3166,21 @@ class VideoHighlighterGUI(QWidget):
                 self.append_log(f"❌ Failed to load labels from {filepath}: {e}")
                 return []
 
+    def _custom_model_path(self):
+        """Selected custom detector path, or None when unset. Empty text must
+        coerce to None so the gui_config None-stripping filters drop the key
+        (pipeline falls back to its own defaults on a missing key)."""
+        text = self.custom_model_input.text().strip()
+        return text or None
+
+    def browse_custom_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select trained YOLO model",
+            self.custom_model_input.text() or "models",
+            "YOLO model (*.pt)")
+        if path:
+            self.custom_model_input.setText(path)
+
     def open_object_label_selector(self):
         """Open label selector. For the custom model this offers your trained
         class names; for 'mixed' it merges those with the COCO objects;
@@ -3155,13 +3189,25 @@ class VideoHighlighterGUI(QWidget):
 
         labels = []
         if "custom" in yolo_type:
-            try:
-                from modules.app_paths import custom_keypoint_names
-                labels = custom_keypoint_names()
-            except Exception:
-                labels = []
+            # Detect models: classes.json sidecar written by train_object.py
+            # (torch-free, mirrors how COCO names come from a JSON resource).
+            model_path = self._custom_model_path()
+            if model_path:
+                try:
+                    from modules.dataset_library import read_classes_sidecar
+                    labels = read_classes_sidecar(model_path)
+                except Exception:
+                    labels = []
             if not labels:
-                self.append_log("⚠️ No custom keypoint names found (train a model / check labels).")
+                # Pose models: keypoint-names sidecar path
+                try:
+                    from modules.app_paths import custom_keypoint_names
+                    labels = custom_keypoint_names()
+                except Exception:
+                    labels = []
+            if not labels:
+                self.append_log("⚠️ No class names found for the custom model "
+                                "(expected classes.json next to the .pt).")
 
         if yolo_type != "custom":  # standard or mixed -> include COCO objects
             if os.path.exists(YOLO_OBJECTS_LABELS_FILE):
@@ -3799,7 +3845,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": self._custom_model_path(),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
