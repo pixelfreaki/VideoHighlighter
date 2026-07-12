@@ -160,6 +160,11 @@ def test_extract_rejects_non_zip(tmp_path):
         di.extract_zip(fake, tmp_path / "out")
 
 
+def test_extract_missing_file_says_not_found(tmp_path):
+    with pytest.raises(di.DatasetImportError, match="not found"):
+        di.extract_zip(tmp_path / "gone.zip", tmp_path / "out")
+
+
 def test_extract_rejects_oversized_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(di, "MAX_ENTRY_UNCOMPRESSED", 4)
     zp = tmp_path / "big.zip"

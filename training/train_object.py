@@ -58,6 +58,9 @@ def parse_args(argv):
                     help="Keep the temporary ZIP extraction directory")
     ap.add_argument("--summary", action="store_true",
                     help="Show library contents and exit (no training)")
+    ap.add_argument("--retrain", action="store_true",
+                    help="Train on the current library without importing "
+                         "anything (source ZIPs not needed)")
     ap.add_argument("--force", action="store_true",
                     help="Re-import a dataset version the library already has")
     return ap.parse_args(argv)
@@ -163,8 +166,8 @@ def main(argv=None):
     if args.summary:
         print_summary()
         return
-    if not args.dataset:
-        sys.exit("[x] --dataset is required (or use --summary)")
+    if not args.dataset and not args.retrain:
+        sys.exit("[x] --dataset is required (or use --summary / --retrain)")
 
     app_config = di.load_app_config(args.config)
     try:
@@ -173,7 +176,21 @@ def main(argv=None):
     except ValueError as e:
         sys.exit(f"[x] {e}")
 
-    data_yaml, class_names, temp_dir, run_name = import_dataset(args)
+    if args.retrain:
+        # Train on the library as it stands -- the library is self-contained,
+        # so this works after the source ZIPs are long gone.
+        try:
+            manifest = dl.load_manifest(LIBRARY_ROOT)
+        except dl.DatasetLibraryError as e:
+            sys.exit(f"[x] {e}")
+        if not manifest["imports"]:
+            sys.exit("[x] library is empty -- import a dataset first")
+        data_yaml = dl.write_library_data_yaml(LIBRARY_ROOT, manifest)
+        print(f"[ok] retraining on the library "
+              f"({len(manifest['classes'])} classes)")
+        temp_dir, run_name = None, "library"
+    else:
+        data_yaml, class_names, temp_dir, run_name = import_dataset(args)
     device = resolve_device(args.device)
     print(f"\nBase model: {start}")
     print(f"Device: {device}")
@@ -199,22 +216,46 @@ def main(argv=None):
     best = Path(model.trainer.best)
     elapsed = time.time() - t0
 
-    # Held-out metrics: prefer the test split when the dataset has one.
+    # Held-out metrics: prefer the test split when the dataset has one. The
+    # library may have been enriched by another import while this run trained
+    # (training is pinned by ultralytics' label cache, but a fresh val re-scans
+    # the live folders) -- so a failed evaluation falls back to the
+    # training-time validation metrics instead of losing the run's sidecars.
     final = YOLO(str(best))
+    names = list(final.names.values())
     spec = di.load_yaml_file(data_yaml)
     split = "test" if spec.get("test") else "val"
-    m = final.val(data=str(data_yaml), split=split, device=device)
-    names = list(final.names.values())
     per_class = {}
-    for i, v in zip(m.box.ap_class_index.tolist(),
-                    m.box.maps[m.box.ap_class_index].tolist()):
-        per_class[names[i]] = round(float(v), 4)
+    try:
+        if len(spec.get("names") or []) != len(names):
+            raise RuntimeError(
+                f"dataset now has {len(spec.get('names') or [])} classes but "
+                f"the model was trained on {len(names)} -- the library "
+                f"changed during training")
+        m = final.val(data=str(data_yaml), split=split, device=device)
+        for i, v in zip(m.box.ap_class_index.tolist(),
+                        m.box.maps[m.box.ap_class_index].tolist()):
+            per_class[names[i]] = round(float(v), 4)
+        headline = {
+            "mAP50": round(float(m.box.map50), 4),
+            "mAP50_95": round(float(m.box.map), 4),
+            "precision": round(float(m.box.mp), 4),
+            "recall": round(float(m.box.mr), 4),
+        }
+    except Exception as e:
+        print(f"\n[!] held-out evaluation unavailable ({e}); "
+              f"reporting training-time validation metrics instead.")
+        split = "val (training-time)"
+        rm = getattr(model.trainer, "metrics", {}) or {}
+        headline = {
+            "mAP50": round(float(rm.get("metrics/mAP50(B)", 0.0)), 4),
+            "mAP50_95": round(float(rm.get("metrics/mAP50-95(B)", 0.0)), 4),
+            "precision": round(float(rm.get("metrics/precision(B)", 0.0)), 4),
+            "recall": round(float(rm.get("metrics/recall(B)", 0.0)), 4),
+        }
     metrics = {
         "split": split,
-        "mAP50": round(float(m.box.map50), 4),
-        "mAP50_95": round(float(m.box.map), 4),
-        "precision": round(float(m.box.mp), 4),
-        "recall": round(float(m.box.mr), 4),
+        **headline,
         "per_class_AP50_95": per_class,
         "epochs": args.epochs,
         "training_seconds": round(elapsed),

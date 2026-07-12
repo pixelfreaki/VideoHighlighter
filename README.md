@@ -79,6 +79,9 @@ model** that detects all of them. A few things worth knowing:
   delete (re-importing the same version is detected and skipped anyway).
 - `python training/train_object.py --summary` shows what's in the library
   (datasets, classes, image counts) without training anything.
+- `python training/train_object.py --retrain` trains on the library as it
+  stands, no ZIP needed — useful after tweaking settings or recovering an
+  interrupted run.
 - `--standalone` trains just the given dataset without touching the library
   (and only there `--weights path/to/best.pt` fine-tunes an existing model).
 

@@ -133,6 +133,24 @@ def test_library_spec_shape(tmp_path):
     assert spec["test"] == "test/images"  # make_dataset builds a test split
 
 
+def test_polygon_labels_converted_to_bboxes(tmp_path):
+    src = tmp_path / "src_poly"
+    src.mkdir()
+    spec = make_dataset(src, names=("Hook", "Pallet"), images_per_split=1)
+    spec["roboflow"] = {"project": "dbd", "version": "2"}
+    # overwrite one label with a segmentation polygon (class + 3 xy pairs)
+    lbl = next((src / "train" / "labels").glob("*.txt"))
+    lbl.write_text("1 0.1 0.2 0.5 0.2 0.3 0.6\n")
+    dl.merge_dataset(tmp_path / "library", src, spec)
+    out = next((tmp_path / "library" / "train" / "labels").glob("dbd_*.txt"))
+    parts = out.read_text().split()
+    assert len(parts) == 5  # class + xc yc w h
+    assert parts[0] == "1"
+    xc, yc, w, h = (float(v) for v in parts[1:])
+    assert (xc, yc) == (0.3, 0.4)
+    assert (w, h) == (0.4, pytest.approx(0.4))
+
+
 def test_classes_sidecar_round_trip(tmp_path):
     run = tmp_path / "weights"
     run.mkdir()

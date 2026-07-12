@@ -175,8 +175,22 @@ def merge_dataset(library_root, dataset_root, spec: dict,
                 parts = line.split()
                 if not parts:
                     continue
-                parts[0] = str(id_map[int(parts[0])])
-                lines.append(" ".join(parts))
+                cls = str(id_map[int(parts[0])])
+                coords = parts[1:]
+                if len(coords) > 4:
+                    # Segmentation polygon (class x1 y1 x2 y2 ...) -- convert
+                    # to its bounding box. Ultralytics drops segment labels
+                    # outright in a mixed detect dataset, silently losing the
+                    # annotation; the box keeps it usable for detection.
+                    n = len(coords) // 2 * 2
+                    xs = [float(v) for v in coords[0:n:2]]
+                    ys = [float(v) for v in coords[1:n:2]]
+                    xc = (min(xs) + max(xs)) / 2
+                    yc = (min(ys) + max(ys)) / 2
+                    w = max(xs) - min(xs)
+                    h = max(ys) - min(ys)
+                    coords = [f"{v:.6f}" for v in (xc, yc, w, h)]
+                lines.append(" ".join([cls] + list(coords)))
             lbl_target.write_text("\n".join(lines) + "\n", encoding="utf-8")
             n += 1
         copied[split] = n

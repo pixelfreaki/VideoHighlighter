@@ -1,0 +1,32 @@
+{
+  "names": [
+    "non threat",
+    "threat-detection",
+    "Comum",
+    "Corredor",
+    "Estrategista",
+    "Mutante",
+    "Tanque",
+    "Blood",
+    "Chest",
+    "Entity",
+    "Flashlight",
+    "Generator",
+    "Hook",
+    "Killer-Host_Face",
+    "Killer-Pig",
+    "Locker",
+    "Pallet",
+    "Pallet-Brocken",
+    "Pallet-Down",
+    "Scratchmarks",
+    "Survivor",
+    "Survivor-BeingHealed",
+    "Survivor-Down",
+    "Survivor-Healing",
+    "Survivor-Hooked",
+    "Survivor-Hurt",
+    "Totem",
+    "Window"
+  ]
+}

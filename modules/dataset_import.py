@@ -72,6 +72,8 @@ def extract_zip(zip_path, dest_dir) -> Path:
     and drive-letter entries are all rejected by the same check.
     """
     zip_path, dest = Path(zip_path), Path(dest_dir)
+    if not zip_path.exists():
+        raise DatasetImportError(f"dataset not found: {zip_path}")
     if not zipfile.is_zipfile(zip_path):
         raise DatasetImportError(f"not a valid ZIP archive: {zip_path}")
     dest.mkdir(parents=True, exist_ok=True)
