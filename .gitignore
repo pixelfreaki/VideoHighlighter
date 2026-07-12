@@ -18,3 +18,8 @@ config/*
 object_log.csv
 # YOLO dataset library (training data, not committed)
 datasets/
+
+# training outputs and model weights (not committed)
+models/
+runs/
+*.pt

@@ -1,9 +1,0 @@
-{
-  "split": "val (training-time; library changed during training)",
-  "mAP50": 0.9187,
-  "mAP50_95": 0.7654,
-  "precision": 0.877,
-  "recall": 0.8783,
-  "per_class_AP50_95": {},
-  "epochs": 100
-}
