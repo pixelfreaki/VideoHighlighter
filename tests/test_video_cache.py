@@ -550,3 +550,37 @@ def test_different_custom_model_paths_differ():
         {**base, "yolo_custom_model_path": "models/library/best.pt"}, {},
         sample_rate=5, video_duration=60.0)
     assert a != b
+
+
+# ---------------------------------------------------------------------------
+# Adaptive highlight selection exclusion (KTD6) -- selection_mode/tiers/
+# clip_count_min/max only change which already-scored seconds get selected,
+# never the analysis itself, so they must never enter the cache signature.
+# ---------------------------------------------------------------------------
+
+def test_adaptive_selection_keys_excluded_from_cache_params():
+    fixed = build_analysis_cache_params(
+        {"selection_mode": "fixed"}, {}, sample_rate=5, video_duration=60.0)
+    adaptive = build_analysis_cache_params(
+        {
+            "selection_mode": "adaptive",
+            "tiers": [{"max_source_duration": 3600, "percentage": 0.1,
+                       "min_duration": 120, "max_duration": 600}],
+            "clip_count_min": 5, "clip_count_max": 15,
+        },
+        {}, sample_rate=5, video_duration=60.0,
+    )
+    assert fixed == adaptive  # identical signature despite wildly different selection config
+    for key in ("selection_mode", "tiers", "clip_count_min", "clip_count_max"):
+        assert key not in fixed
+        assert key not in adaptive
+
+
+def test_existing_signature_keys_unaffected_by_adaptive_settings():
+    base = build_analysis_cache_params({}, {}, sample_rate=5, video_duration=60.0)
+    with_adaptive = build_analysis_cache_params(
+        {"selection_mode": "adaptive", "tiers": [{"percentage": 0.5}],
+         "clip_count_min": 1, "clip_count_max": 2},
+        {}, sample_rate=5, video_duration=60.0,
+    )
+    assert base == with_adaptive

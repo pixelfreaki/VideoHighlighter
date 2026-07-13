@@ -141,6 +141,14 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "advanced_scoring": _advanced_scoring_signature(advanced_scoring),
     }
 
+    # Adaptive highlight selection (selection_mode, tiers, clip_count_min/max,
+    # overflow_pct, segment_*) is deliberately excluded from this signature.
+    # Those settings only change which already-scored seconds get SELECTED
+    # into the final highlight, never the analysis itself (detection/scoring
+    # arrays are identical either way) -- the same reasoning that excludes
+    # scoring.* point weights and advanced_scoring's per-group weight above.
+    # Do not add them here; see docs/plans/2026-07-13-001-feat-adaptive-top-x-selection-plan.md KTD6.
+
     # Custom-detector identity: which model produced the object detections.
     # Included only when a custom detector is active -- the cache signature
     # hashes this whole dict, so standard-mode params must serialize
