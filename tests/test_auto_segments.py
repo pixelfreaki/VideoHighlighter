@@ -1,9 +1,15 @@
-"""Tests for modules/auto_segments.py -- select_regions_bounded (U2).
+"""Tests for modules/auto_segments.py -- select_regions_bounded (U2) and
+select_fixed_window_segments (U3's fixed-window integration).
 
 Covers AE4-AE6 from docs/plans/2026-07-13-001-feat-adaptive-top-x-selection-plan.md.
 """
 
-from modules.auto_segments import Region, select_regions, select_regions_bounded
+import numpy as np
+
+from modules.auto_segments import (
+    Region, select_regions, select_regions_bounded, select_fixed_window_segments,
+    build_auto_segments,
+)
 
 
 def _regions(*specs):
@@ -131,3 +137,166 @@ def test_overlapping_candidates_second_one_rejected():
     assert len(selected) == 1
     assert selected[0].start == 0
     assert any(reason == "overlap" for _, reason in rejected)
+
+
+# --- select_fixed_window_segments: characterization vs. the original -------
+# pipeline.py loop (pipeline.py:1982-2033, pre-refactor). This is the U3 P0
+# fix's core correctness claim: legacy defaults must reproduce pipeline.py's
+# original fixed-window selection byte-for-byte (segment boundaries, not
+# just aggregate duration/count).
+
+def _original_fixed_window_loop(score, video_duration, target_duration,
+                                 duration_mode, clip_time, detections_by_sec,
+                                 exact_duration=None, max_duration=None):
+    """Verbatim reference copy of pipeline.py's pre-refactor fixed-window
+    loop (pipeline.py:1982-2033), parameterized instead of reading globals."""
+    if duration_mode == "EXACT":
+        candidate_indices = np.arange(len(score))
+    else:
+        candidate_indices = np.where(score > 0)[0]
+
+    candidate_scores = score[candidate_indices]
+    candidate_confidences = np.zeros(len(candidate_indices))
+    for idx, sec in enumerate(candidate_indices):
+        if sec in detections_by_sec:
+            candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
+
+    sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))
+    top_indices_all = candidate_indices[sorted_indices]
+
+    segments = []
+    used_seconds = set()
+
+    for sec in top_indices_all:
+        if sec in used_seconds:
+            continue
+
+        start = max(0, sec - clip_time // 2)
+        end = min(video_duration, start + clip_time)
+
+        if end - start < clip_time and end < video_duration:
+            end = min(video_duration, start + clip_time)
+        if end - start < clip_time and start > 0:
+            start = max(0, end - clip_time)
+
+        if any(s in used_seconds for s in range(int(start), int(end))):
+            continue
+
+        current_duration = sum(e - s for s, e in segments)
+        remaining = target_duration - current_duration
+        if remaining <= 0:
+            break
+        if end - start > remaining:
+            end = start + remaining
+
+        segments.append((start, end))
+        for s in range(int(start), int(end)):
+            used_seconds.add(s)
+
+        current_duration = sum(e - s for s, e in segments)
+        if duration_mode == "EXACT" and current_duration >= exact_duration:
+            break
+        elif duration_mode == "MAX" and current_duration >= max_duration:
+            break
+
+    segments.sort(key=lambda x: x[0])
+    return segments
+
+
+def _make_score(length, peaks):
+    score = np.zeros(length)
+    for sec, val in peaks.items():
+        score[sec] = val
+    return score
+
+
+def test_fixed_window_legacy_defaults_match_original_loop_max_mode():
+    score = _make_score(120, {5: 8, 20: 6, 40: 9, 70: 3, 90: 5})
+    detections_by_sec = {20: [("obj", 0.9)], 40: [("obj", 0.4)]}
+    original = _original_fixed_window_loop(
+        score, video_duration=120, target_duration=30, duration_mode="MAX",
+        clip_time=10, detections_by_sec=detections_by_sec, max_duration=30)
+
+    new_segments, _ = select_fixed_window_segments(
+        score, video_duration=120, target_duration=30, duration_mode="MAX",
+        clip_time=10, detections_by_sec=detections_by_sec)
+
+    assert new_segments == original
+
+
+def test_fixed_window_legacy_defaults_match_original_loop_exact_mode():
+    score = _make_score(60, {2: 1, 15: 4, 30: 2, 45: 7})
+    detections_by_sec = {}
+    original = _original_fixed_window_loop(
+        score, video_duration=60, target_duration=25, duration_mode="EXACT",
+        clip_time=8, detections_by_sec=detections_by_sec, exact_duration=25)
+
+    new_segments, _ = select_fixed_window_segments(
+        score, video_duration=60, target_duration=25, duration_mode="EXACT",
+        clip_time=8, detections_by_sec=detections_by_sec)
+
+    assert new_segments == original
+
+
+def test_fixed_window_legacy_defaults_match_original_loop_dense_scores():
+    rng_scores = {i: (i % 7) for i in range(0, 200, 3)}
+    score = _make_score(200, rng_scores)
+    detections_by_sec = {i: [("x", (i % 5) / 5.0)] for i in range(0, 200, 11)}
+    original = _original_fixed_window_loop(
+        score, video_duration=200, target_duration=60, duration_mode="MAX",
+        clip_time=6, detections_by_sec=detections_by_sec, max_duration=60)
+
+    new_segments, _ = select_fixed_window_segments(
+        score, video_duration=200, target_duration=60, duration_mode="MAX",
+        clip_time=6, detections_by_sec=detections_by_sec)
+
+    assert new_segments == original
+
+
+def test_fixed_window_no_candidates_returns_empty():
+    score = np.zeros(50)
+    segments, rejected = select_fixed_window_segments(
+        score, video_duration=50, target_duration=30, duration_mode="MAX",
+        clip_time=10, detections_by_sec={})
+    assert segments == []
+    assert rejected == []
+
+
+def test_fixed_window_adaptive_clip_count_bounds():
+    score = _make_score(300, {i: 5 for i in range(0, 300, 20)})
+    segments, _ = select_fixed_window_segments(
+        score, video_duration=300, target_duration=10000, duration_mode="MAX",
+        clip_time=5, detections_by_sec={}, clip_count_min=0, clip_count_max=3)
+    assert len(segments) == 3
+
+
+# --- build_auto_segments Step 4 rewiring (select_regions -> select_regions_bounded) --
+
+def test_build_auto_segments_legacy_defaults_produces_sane_output():
+    score = _make_score(300, {10: 5, 45: 8, 120: 3, 200: 6, 250: 4})
+    segments, regions = build_auto_segments(
+        video_duration=300, score=score,
+        scenes=[(8, 15), (43, 50)],
+        motion_events=[118, 119],
+        audio_peaks=[198, 199, 249],
+        target_duration=60, duration_mode="MAX",
+        log_fn=lambda *a, **k: None,
+    )
+    assert segments  # non-empty: real signals should produce real segments
+    assert sum(e - s for s, e in segments) <= 60 + 1e-6  # legacy: no overflow
+    assert len(regions) == len(segments)
+    # chronological, non-overlapping
+    for (s1, e1), (s2, e2) in zip(segments, segments[1:]):
+        assert e1 <= s2
+
+
+def test_build_auto_segments_adaptive_clip_count_bounds():
+    score = _make_score(300, {i: 5 for i in range(5, 295, 15)})
+    segments, _ = build_auto_segments(
+        video_duration=300, score=score,
+        motion_events=list(range(5, 295, 15)),
+        target_duration=10000, duration_mode="MAX",
+        clip_count_min=0, clip_count_max=3,
+        log_fn=lambda *a, **k: None,
+    )
+    assert len(segments) <= 3
