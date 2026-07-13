@@ -1276,6 +1276,219 @@ class VideoHighlighterGUI(QWidget):
         # Trigger once to set initial state
         on_clip_time_changed(self.spin_clip_time.value())
 
+        # ── Adaptive Top-X selection (U5) ──
+        self.combo_selection_mode = QComboBox()
+        self.combo_selection_mode.addItem("Fixed (max/exact duration above)", "fixed")
+        self.combo_selection_mode.addItem("Adaptive (size budget from source duration)", "adaptive")
+        idx_sel_mode = self.combo_selection_mode.findData(highlights_cfg.get("selection_mode", "fixed"))
+        self.combo_selection_mode.setCurrentIndex(idx_sel_mode if idx_sel_mode >= 0 else 0)
+        duration_form.addRow("Selection mode:", self.combo_selection_mode)
+
+        self.adaptive_group = QGroupBox("Adaptive Tiers")
+        adaptive_layout = QVBoxLayout()
+
+        self.adaptive_note_label = QLabel("")
+        self.adaptive_note_label.setStyleSheet("color: #E65100; font-style: italic; padding: 2px;")
+        self.adaptive_note_label.setWordWrap(True)
+        self.adaptive_note_label.setVisible(False)
+        adaptive_layout.addWidget(self.adaptive_note_label)
+
+        # Table: Max Source (s, 0 = no limit / fallback) | Percentage (%) | Min (s) | Max (s) | [Del]
+        self.tier_table = QTableWidget(0, 5)
+        self.tier_table.setHorizontalHeaderLabels(
+            ["Up to source (s, 0=no limit)", "Percentage (%)", "Min budget (s)", "Max budget (s)", ""])
+        self.tier_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tier_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.tier_table.setColumnWidth(4, 32)
+        self.tier_table.setMinimumHeight(120)
+        self.tier_table.setMaximumHeight(220)
+        self.tier_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        adaptive_layout.addWidget(self.tier_table)
+
+        self.tier_error_label = QLabel("")
+        self.tier_error_label.setStyleSheet("color: #C62828; font-size: 9pt;")
+        self.tier_error_label.setWordWrap(True)
+        adaptive_layout.addWidget(self.tier_error_label)
+
+        tier_btn_row = QHBoxLayout()
+        tier_add_btn = QPushButton("+ Add Tier")
+        tier_btn_row.addWidget(tier_add_btn)
+        tier_btn_row.addStretch()
+        adaptive_layout.addLayout(tier_btn_row)
+
+        clip_count_form = QFormLayout()
+        self.spin_clip_count_min = QSpinBox(); self.spin_clip_count_min.setRange(1, 100)
+        self.spin_clip_count_min.setValue(int(highlights_cfg.get("clip_count_min", 3)))
+        self.spin_clip_count_max = QSpinBox(); self.spin_clip_count_max.setRange(1, 100)
+        self.spin_clip_count_max.setValue(int(highlights_cfg.get("clip_count_max", 20)))
+        clip_count_form.addRow("Min clips:", self.spin_clip_count_min)
+        clip_count_form.addRow("Max clips:", self.spin_clip_count_max)
+        adaptive_layout.addLayout(clip_count_form)
+
+        adaptive_layout.addWidget(QLabel("Preview (computed budget for standard durations):"))
+        self.tier_preview_table = QTableWidget(0, 2)
+        self.tier_preview_table.setHorizontalHeaderLabels(["Source duration", "Budget"])
+        self.tier_preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tier_preview_table.setMaximumHeight(180)
+        self.tier_preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        adaptive_layout.addWidget(self.tier_preview_table)
+
+        self.adaptive_group.setLayout(adaptive_layout)
+        duration_layout.addWidget(self.adaptive_group)
+
+        # ---- tier table row helpers ----
+        _PREVIEW_DURATIONS = [1800, 3600, 7200, 14400, 28800, 86400]  # KTD5: 30m,1h,2h,4h,8h,24h
+
+        def _tier_add_row(max_source=0, percentage=10.0, min_dur=120, max_dur=600):
+            r = self.tier_table.rowCount()
+            self.tier_table.insertRow(r)
+
+            max_src_spin = QSpinBox()
+            max_src_spin.setRange(0, 999999)
+            max_src_spin.setSpecialValueText("No limit (fallback)")
+            max_src_spin.setValue(int(max_source or 0))
+            self.tier_table.setCellWidget(r, 0, max_src_spin)
+
+            pct_spin = QDoubleSpinBox()
+            pct_spin.setRange(0.1, 100.0)
+            pct_spin.setSuffix(" %")
+            pct_spin.setValue(float(percentage))
+            self.tier_table.setCellWidget(r, 1, pct_spin)
+
+            min_spin = QSpinBox(); min_spin.setRange(1, 999999); min_spin.setValue(int(min_dur))
+            self.tier_table.setCellWidget(r, 2, min_spin)
+            max_spin = QSpinBox(); max_spin.setRange(1, 999999); max_spin.setValue(int(max_dur))
+            self.tier_table.setCellWidget(r, 3, max_spin)
+
+            del_btn = QPushButton("✕")
+            del_btn.setMaximumWidth(28)
+            del_btn.setToolTip("Remove tier")
+            del_btn.clicked.connect(lambda: _tier_delete_row(del_btn))
+            self.tier_table.setCellWidget(r, 4, del_btn)
+
+            for w in (max_src_spin, pct_spin, min_spin, max_spin):
+                w.valueChanged.connect(_tier_revalidate)
+            _tier_revalidate()
+
+        def _tier_row_of(button):
+            for r in range(self.tier_table.rowCount()):
+                if self.tier_table.cellWidget(r, 4) is button:
+                    return r
+            return -1
+
+        def _tier_is_fallback_row(r):
+            # A fallback (no-limit) row is the one whose Max Source spinner is
+            # at its special "No limit" value (0) -- the row that would sort
+            # last. The last row in table order is always the intended
+            # fallback; guard deletion of it so the table can never reach
+            # zero tiers with no fallback match (design-lens finding).
+            return r == self.tier_table.rowCount() - 1
+
+        def _tier_delete_row(button):
+            r = _tier_row_of(button)
+            if r < 0:
+                return
+            if self.tier_table.rowCount() <= 1:
+                return  # never delete the last remaining tier
+            self.tier_table.removeRow(r)
+            _tier_revalidate()
+
+        def _tier_read_rows():
+            rows = []
+            for r in range(self.tier_table.rowCount()):
+                max_src = self.tier_table.cellWidget(r, 0).value()
+                rows.append({
+                    "max_source_duration": None if max_src == 0 else max_src,
+                    "percentage": self.tier_table.cellWidget(r, 1).value() / 100.0,
+                    "min_duration": self.tier_table.cellWidget(r, 2).value(),
+                    "max_duration": self.tier_table.cellWidget(r, 3).value(),
+                })
+            return rows
+
+        def _tier_validate(rows, clip_min, clip_max):
+            if not rows:
+                return "At least one tier is required."
+            for i, t in enumerate(rows):
+                if t["min_duration"] > t["max_duration"]:
+                    return f"Tier {i+1}: min budget must be ≤ max budget."
+            finite = [t["max_source_duration"] for t in rows if t["max_source_duration"] is not None]
+            if finite != sorted(finite):
+                return "Tiers must be ordered ascending by 'Up to source'."
+            if rows[-1]["max_source_duration"] is not None:
+                return "The last tier must be the fallback (No limit)."
+            if any(t["max_source_duration"] is None for t in rows[:-1]):
+                return "Only the last tier may be the fallback (No limit)."
+            if clip_min > clip_max:
+                return "Min clips must be ≤ max clips."
+            return None
+
+        def _tier_revalidate():
+            rows = _tier_read_rows()
+            error = _tier_validate(rows, self.spin_clip_count_min.value(), self.spin_clip_count_max.value())
+            if error:
+                self.tier_error_label.setText(f"⚠ {error}")
+                self._tiers_valid = False
+                # last-known-valid tiers (self._tiers) is left untouched --
+                # save reads that, not the live invalid table state.
+            else:
+                self.tier_error_label.setText("")
+                self._tiers_valid = True
+                self._tiers = rows
+            _tier_update_preview()
+
+        def _tier_update_preview():
+            # Freezes at the last valid computation while the table is
+            # invalid, rather than clearing or erroring (design-lens finding).
+            from modules.highlight_budget import resolve_adaptive_budget
+            tiers_for_preview = getattr(self, "_tiers", [])
+            self.tier_preview_table.setRowCount(0)
+            for dur in _PREVIEW_DURATIONS:
+                budget, _mode = resolve_adaptive_budget(
+                    {"highlights": {"exact_duration": None, "tiers": tiers_for_preview}}, dur
+                ) if tiers_for_preview else (0, "MAX")
+                r = self.tier_preview_table.rowCount()
+                self.tier_preview_table.insertRow(r)
+                hrs = dur / 3600
+                dur_label = f"{int(dur/60)} min" if dur < 3600 else f"{hrs:.0f}h"
+                self.tier_preview_table.setItem(r, 0, QTableWidgetItem(dur_label))
+                self.tier_preview_table.setItem(r, 1, QTableWidgetItem(f"{budget/60:.1f} min"))
+
+        tier_add_btn.clicked.connect(lambda: _tier_add_row())
+        self.spin_clip_count_min.valueChanged.connect(_tier_revalidate)
+        self.spin_clip_count_max.valueChanged.connect(_tier_revalidate)
+
+        # ---- load existing tiers (or shipped defaults) ----
+        self._tiers = []
+        self._tiers_valid = True
+        _existing_tiers = highlights_cfg.get("tiers") or [
+            {"max_source_duration": 3600, "percentage": 0.10, "min_duration": 120, "max_duration": 600},
+            {"max_source_duration": 14400, "percentage": 0.05, "min_duration": 300, "max_duration": 1200},
+            {"max_source_duration": None, "percentage": 0.025, "min_duration": 300, "max_duration": 1800},
+        ]
+        for t in _existing_tiers:
+            _tier_add_row(
+                max_source=t.get("max_source_duration") or 0,
+                percentage=float(t.get("percentage", 0.1)) * 100.0,
+                min_dur=t.get("min_duration", 120),
+                max_dur=t.get("max_duration", 600),
+            )
+
+        # ── Show/hide adaptive controls + disable max_duration in adaptive mode ──
+        def on_selection_mode_changed(_index=None):
+            is_adaptive = (self.combo_selection_mode.currentData() == "adaptive")
+            self.adaptive_group.setVisible(is_adaptive)
+            self.spin_max_duration.setEnabled(not is_adaptive)
+            if is_adaptive and self.spin_exact_duration.value() > 0:
+                self.adaptive_note_label.setText(
+                    "Exact duration is set above — tiers are unused while it's nonzero.")
+                self.adaptive_note_label.setVisible(True)
+            else:
+                self.adaptive_note_label.setVisible(False)
+
+        self.combo_selection_mode.currentIndexChanged.connect(on_selection_mode_changed)
+        self.spin_exact_duration.valueChanged.connect(on_selection_mode_changed)
+        on_selection_mode_changed()
+
         # Highlight object classes
         obj_layout = QHBoxLayout()
         self.objects_input = QLineEdit(",".join(self.config_data.get("objects", {}).get("interesting", [])))
@@ -2419,6 +2632,10 @@ class VideoHighlighterGUI(QWidget):
             "clip_time": int(self.spin_clip_time.value()),
             "max_duration": int(self.spin_max_duration.value()),
             "exact_duration": exact_duration,
+            "selection_mode": self.combo_selection_mode.currentData(),
+            "tiers": self._tiers,
+            "clip_count_min": int(self.spin_clip_count_min.value()),
+            "clip_count_max": int(self.spin_clip_count_max.value()),
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
@@ -2965,6 +3182,18 @@ class VideoHighlighterGUI(QWidget):
                 "use_time_range": self.use_time_range_chk.isChecked(),
                 "range_start_pct": self.range_slider.start(),
                 "range_end_pct": self.range_slider.end(),
+                "selection_mode": self.combo_selection_mode.currentData(),
+                "tiers": self._tiers,
+                "clip_count_min": int(self.spin_clip_count_min.value()),
+                "clip_count_max": int(self.spin_clip_count_max.value()),
+                # overflow_pct/segment_* have no GUI widget (YAML-only, like
+                # keywords.advanced_scoring) -- preserve whatever is already
+                # on disk rather than silently resetting it to a default.
+                "overflow_pct": self.config_data.get("highlights", {}).get("overflow_pct", 0.10),
+                "segment_distribution_enabled": self.config_data.get("highlights", {}).get(
+                    "segment_distribution_enabled", False),
+                "segment_minutes": self.config_data.get("highlights", {}).get("segment_minutes", 30),
+                "segment_cap": self.config_data.get("highlights", {}).get("segment_cap"),
             },
             "scoring": {
                 "scene_points": int(self.spin_scene_points.value()),
@@ -3840,6 +4069,10 @@ class VideoHighlighterGUI(QWidget):
             "clip_time": int(self.spin_clip_time.value()),
             "max_duration": int(self.spin_max_duration.value()),
             "exact_duration": exact_duration,
+            "selection_mode": self.combo_selection_mode.currentData(),
+            "tiers": self._tiers,
+            "clip_count_min": int(self.spin_clip_count_min.value()),
+            "clip_count_max": int(self.spin_clip_count_max.value()),
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
