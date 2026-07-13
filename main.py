@@ -1368,21 +1368,14 @@ class VideoHighlighterGUI(QWidget):
 
             for w in (max_src_spin, pct_spin, min_spin, max_spin):
                 w.valueChanged.connect(_tier_revalidate)
-            _tier_revalidate()
+            if not self._tiers_loading:
+                _tier_revalidate()
 
         def _tier_row_of(button):
             for r in range(self.tier_table.rowCount()):
                 if self.tier_table.cellWidget(r, 4) is button:
                     return r
             return -1
-
-        def _tier_is_fallback_row(r):
-            # A fallback (no-limit) row is the one whose Max Source spinner is
-            # at its special "No limit" value (0) -- the row that would sort
-            # last. The last row in table order is always the intended
-            # fallback; guard deletion of it so the table can never reach
-            # zero tiers with no fallback match (design-lens finding).
-            return r == self.tier_table.rowCount() - 1
 
         def _tier_delete_row(button):
             r = _tier_row_of(button)
@@ -1465,6 +1458,7 @@ class VideoHighlighterGUI(QWidget):
             {"max_source_duration": 14400, "percentage": 0.05, "min_duration": 300, "max_duration": 1200},
             {"max_source_duration": None, "percentage": 0.025, "min_duration": 300, "max_duration": 1800},
         ]
+        self._tiers_loading = True
         for t in _existing_tiers:
             _tier_add_row(
                 max_source=t.get("max_source_duration") or 0,
@@ -1472,6 +1466,8 @@ class VideoHighlighterGUI(QWidget):
                 min_dur=t.get("min_duration", 120),
                 max_dur=t.get("max_duration", 600),
             )
+        self._tiers_loading = False
+        _tier_revalidate()
 
         # ── Show/hide adaptive controls + disable max_duration in adaptive mode ──
         def on_selection_mode_changed(_index=None):
@@ -3122,6 +3118,11 @@ class VideoHighlighterGUI(QWidget):
         return {}
 
     def save_config(self):
+        # overflow_pct/segment_* have no GUI widget (YAML-only, like
+        # keywords.advanced_scoring) -- read once, preserve whatever is
+        # already on disk rather than silently resetting it to a default.
+        _highlights_on_disk = self.config_data.get("highlights", {})
+
         # Helper function to get non-empty text or empty list
         def get_text_list(input_field):
             text = input_field.text().strip()
@@ -3186,14 +3187,10 @@ class VideoHighlighterGUI(QWidget):
                 "tiers": self._tiers,
                 "clip_count_min": int(self.spin_clip_count_min.value()),
                 "clip_count_max": int(self.spin_clip_count_max.value()),
-                # overflow_pct/segment_* have no GUI widget (YAML-only, like
-                # keywords.advanced_scoring) -- preserve whatever is already
-                # on disk rather than silently resetting it to a default.
-                "overflow_pct": self.config_data.get("highlights", {}).get("overflow_pct", 0.10),
-                "segment_distribution_enabled": self.config_data.get("highlights", {}).get(
-                    "segment_distribution_enabled", False),
-                "segment_minutes": self.config_data.get("highlights", {}).get("segment_minutes", 30),
-                "segment_cap": self.config_data.get("highlights", {}).get("segment_cap"),
+                "overflow_pct": _highlights_on_disk.get("overflow_pct", 0.10),
+                "segment_distribution_enabled": _highlights_on_disk.get("segment_distribution_enabled", False),
+                "segment_minutes": _highlights_on_disk.get("segment_minutes", 30),
+                "segment_cap": _highlights_on_disk.get("segment_cap"),
             },
             "scoring": {
                 "scene_points": int(self.spin_scene_points.value()),

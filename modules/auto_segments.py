@@ -25,7 +25,23 @@ Usage:
 """
 
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
+
+
+def _shares_time(a, b):
+    """True if two Region-like objects (start/end) overlap in continuous time."""
+    return min(a.end, b.end) - max(a.start, b.start) > 0.0
+
+
+def log_rejected_segments(log_fn, rejected):
+    """Shared R11-style rejection-reason summary for select_regions_bounded's
+    (candidate, reason) output -- used by both build_auto_segments and
+    pipeline.py's fixed-window path."""
+    if not rejected:
+        return
+    reason_counts = Counter(reason for _, reason in rejected)
+    log_fn(f"   Rejected {len(rejected)} candidates: "
+           + ", ".join(f"{n} {reason}" for reason, n in reason_counts.most_common()))
 
 
 # ---------------------------------------------------------------------------
@@ -327,9 +343,6 @@ def select_regions(regions, target_duration, duration_mode="MAX"):
     if not regions:
         return [], []
 
-    def _shares_time(a, b):
-        return min(a.end, b.end) - max(a.start, b.start) > 0.0
-
     for r in regions:
         r._density = r.score / max(0.5, r.duration)
 
@@ -416,9 +429,6 @@ def select_regions_bounded(
     if not candidates:
         return [], []
 
-    def _shares_time(a, b):
-        return min(a.end, b.end) - max(a.start, b.start) > 0.0
-
     def _segment_index(c):
         if not segments:
             return None
@@ -428,6 +438,7 @@ def select_regions_bounded(
         return len(segments) - 1  # trailing candidates clamp to the last segment
 
     max_clips = clip_count_max if clip_count_max is not None else float("inf")
+    segment_caps_active = segments is not None and segment_cap is not None
 
     selected = []
     rejected = []
@@ -437,25 +448,27 @@ def select_regions_bounded(
 
     for pos, c in enumerate(candidates):
         if len(selected) >= max_clips:
-            rejected.append((c, "clip_count_max reached"))
-            continue
+            # No later candidate can ever be selected once the cap is hit --
+            # bulk-reject the remainder instead of scanning one at a time
+            # (a long EXACT-mode candidate list can be tens of thousands of
+            # per-second Regions).
+            rejected.extend((cc, "clip_count_max reached") for cc in candidates[pos:])
+            break
         if any(_shares_time(c, s) for s in selected):
             rejected.append((c, "overlap"))
             continue
 
-        seg_idx = _segment_index(c)
-        if segments is not None and segment_cap is not None and seg_idx is not None:
-            if seg_counts.get(seg_idx, 0) >= segment_cap:
-                still_selecting = list(candidates[pos + 1:])
-                others_available = any(
-                    _segment_index(o) != seg_idx
-                    and not any(_shares_time(o, s) for s in selected)
-                    for o in still_selecting
-                )
-                if len(selected) >= clip_count_min or others_available:
-                    rejected.append((c, "segment cap"))
-                    continue
-                # else: last resort (R9) -- take it despite the cap
+        seg_idx = _segment_index(c) if segment_caps_active else None
+        if segment_caps_active and seg_idx is not None and seg_counts.get(seg_idx, 0) >= segment_cap:
+            others_available = any(
+                _segment_index(o) != seg_idx
+                and not any(_shares_time(o, s) for s in selected)
+                for o in candidates[pos + 1:]
+            )
+            if len(selected) >= clip_count_min or others_available:
+                rejected.append((c, "segment cap"))
+                continue
+            # else: last resort (R9) -- take it despite the cap
 
         remaining = budget - total
         if remaining <= 0:
@@ -694,14 +707,9 @@ def build_auto_segments(
     total_dur = sum(e - s for s, e in segments)
     log_fn(f"   Selected {len(segments)} segments, total {total_dur:.1f}s "
            f"(target: {target_duration}s, mode: {duration_mode})")
-    if rejected_regions:
-        from collections import Counter
-        reason_counts = Counter(reason for _, reason in rejected_regions)
-        log_fn(f"   Rejected {len(rejected_regions)} candidates: "
-               + ", ".join(f"{n} {reason}" for reason, n in reason_counts.most_common()))
+    log_rejected_segments(log_fn, rejected_regions)
 
     # --- Debug: show what was selected ---
-    from collections import Counter
     for i, reg in enumerate(selected_regions):
         s_mm = f"{int(reg.start)//60:02d}:{int(reg.start)%60:02d}"
         e_mm = f"{int(reg.end)//60:02d}:{int(reg.end)%60:02d}"

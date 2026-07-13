@@ -22,8 +22,8 @@ from modules.video_cache import (
     CHECKPOINTED_STAGES, resolve_completed_stages,
 )
 from modules.video_cutter import cut_video
-from modules.auto_segments import build_auto_segments, select_fixed_window_segments
-from modules.highlight_budget import resolve_selection_constraints, resolve_tier
+from modules.auto_segments import build_auto_segments, select_fixed_window_segments, log_rejected_segments
+from modules.highlight_budget import resolve_selection_constraints, DEFAULT_MAX_DURATION
 from modules.device_utils import resolve_yolo_device, detect_best_device, should_export_yolo_to_openvino
 from modules.app_paths import ffmpeg_exe
 from modules.perf_summary import emit_summary
@@ -476,7 +476,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # Merge CLI/gui-style values with defaults
         OUTPUT_FILE = gui_config.get("output_file") or config.get("video", {}).get("output", "highlight.mp4")
-        MAX_DURATION = gui_config.get("max_duration") or config.get("highlights", {}).get("max_duration", 420)
+        MAX_DURATION = gui_config.get("max_duration") or config.get("highlights", {}).get("max_duration", DEFAULT_MAX_DURATION)
         EXACT_DURATION = gui_config.get("exact_duration") or config.get("highlights", {}).get("exact_duration", None)
         CLIP_TIME = gui_config.get("clip_time") or config.get("highlights", {}).get("clip_time", 10)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
@@ -673,8 +673,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         SEGMENT_CAP = _selection["segment_cap"]
 
         if SELECTION_MODE == "adaptive" and duration_mode != "EXACT":
-            _tiers = gui_config.get("tiers", config.get("highlights", {}).get("tiers", []))
-            _tier = resolve_tier(_tiers, video_duration) if _tiers else None
+            _tier = _selection["tier"]
             tier_desc = (f"tier pct={_tier.get('percentage')} "
                          f"bounds=[{_tier.get('min_duration')},{_tier.get('max_duration')}]"
                          if _tier else "no tiers configured -- fixed-mode default")
@@ -2033,11 +2032,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 clip_count_min=CLIP_COUNT_MIN, clip_count_max=CLIP_COUNT_MAX,
                 overflow_pct=OVERFLOW_PCT, segments=SEGMENT_BOUNDS, segment_cap=SEGMENT_CAP,
             )
-            if rejected_fixed:
-                from collections import Counter as _Counter
-                _reason_counts = _Counter(reason for _, reason in rejected_fixed)
-                log(f"   Rejected {len(rejected_fixed)} candidates: "
-                    + ", ".join(f"{n} {reason}" for reason, n in _reason_counts.most_common()))
+            log_rejected_segments(log, rejected_fixed)
 
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])

@@ -39,7 +39,10 @@ def resolve_selection_constraints(gui_config: dict, config: dict, video_duration
     without pipeline.py's heavy ML import chain.
 
     Returns a dict with keys: selection_mode, target_duration, duration_mode,
-    clip_count_min, clip_count_max, overflow_pct, segment_bounds, segment_cap.
+    tier (the matched tier dict, or None outside adaptive/tier-computed mode
+    -- callers needing a description for logging read this instead of
+    re-deriving tiers and re-calling resolve_tier), clip_count_min,
+    clip_count_max, overflow_pct, segment_bounds, segment_cap.
     Legacy (fixed/absent selection_mode) always resolves clip_count_min=0,
     clip_count_max=None, overflow_pct=0.0, segment_bounds=None, segment_cap=None
     regardless of config, so fixed-mode selection is unaffected by these
@@ -49,24 +52,23 @@ def resolve_selection_constraints(gui_config: dict, config: dict, video_duration
     config = config or {}
     highlights_cfg = config.get("highlights", {}) or {}
 
-    selection_mode = gui_config.get("selection_mode", highlights_cfg.get("selection_mode", "fixed"))
+    def _cfg(key, default):
+        return gui_config.get(key, highlights_cfg.get(key, default))
+
+    selection_mode = _cfg("selection_mode", "fixed")
     exact_duration = gui_config.get("exact_duration") or highlights_cfg.get("exact_duration")
     max_duration = gui_config.get("max_duration") or highlights_cfg.get("max_duration", DEFAULT_MAX_DURATION)
 
+    tier = None
     if selection_mode == "adaptive":
-        tiers = gui_config.get("tiers", highlights_cfg.get("tiers", []))
+        tiers = _cfg("tiers", [])
         target_duration, duration_mode = resolve_adaptive_budget(
             {"highlights": {"exact_duration": exact_duration, "max_duration": max_duration, "tiers": tiers}},
             source_duration=video_duration,
         )
-    else:
-        target_duration = float(exact_duration) if exact_duration else float(max_duration)
-        duration_mode = "EXACT" if exact_duration else "MAX"
+        if duration_mode != "EXACT" and tiers:
+            tier = resolve_tier(tiers, video_duration)
 
-    def _cfg(key, default):
-        return gui_config.get(key, highlights_cfg.get(key, default))
-
-    if selection_mode == "adaptive":
         clip_count_min = int(_cfg("clip_count_min", 0) or 0)
         clip_count_max = _cfg("clip_count_max", None)
         clip_count_max = int(clip_count_max) if clip_count_max else None
@@ -84,6 +86,8 @@ def resolve_selection_constraints(gui_config: dict, config: dict, video_duration
                 segment_bounds.append((pos, min(video_duration, pos + seg_secs)))
                 pos += seg_secs
     else:
+        target_duration = float(exact_duration) if exact_duration else float(max_duration)
+        duration_mode = "EXACT" if exact_duration else "MAX"
         clip_count_min, clip_count_max = 0, None
         overflow_pct = 0.0
         segment_bounds, segment_cap = None, None
@@ -92,6 +96,7 @@ def resolve_selection_constraints(gui_config: dict, config: dict, video_duration
         "selection_mode": selection_mode,
         "target_duration": target_duration,
         "duration_mode": duration_mode,
+        "tier": tier,
         "clip_count_min": clip_count_min,
         "clip_count_max": clip_count_max,
         "overflow_pct": overflow_pct,
