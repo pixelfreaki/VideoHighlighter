@@ -25,7 +25,23 @@ Usage:
 """
 
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
+
+
+def _shares_time(a, b):
+    """True if two Region-like objects (start/end) overlap in continuous time."""
+    return min(a.end, b.end) - max(a.start, b.start) > 0.0
+
+
+def log_rejected_segments(log_fn, rejected):
+    """Shared R11-style rejection-reason summary for select_regions_bounded's
+    (candidate, reason) output -- used by both build_auto_segments and
+    pipeline.py's fixed-window path."""
+    if not rejected:
+        return
+    reason_counts = Counter(reason for _, reason in rejected)
+    log_fn(f"   Rejected {len(rejected)} candidates: "
+           + ", ".join(f"{n} {reason}" for reason, n in reason_counts.most_common()))
 
 
 # ---------------------------------------------------------------------------
@@ -316,43 +332,223 @@ def constrain_regions(regions, score_arr, video_duration, min_dur=1.5, max_dur=3
 
 
 # ---------------------------------------------------------------------------
-# 7. Select non-overlapping regions to fill the duration budget
+# 7b. Constrained selection: clip-count bounds, overflow tolerance, segment
+# distribution -- the shared layer both the auto-segmentation path and the
+# fixed-window path (pipeline.py) select through for adaptive highlight
+# selection. Legacy (fixed/absent selection_mode) behavior is reproduced
+# exactly by calling with the default parameters below (clip_count_max
+# unbounded, overflow_pct=0, segments=None) -- there is no separate "legacy
+# branch"; legacy IS the default-parameter case. Callers control ranking by
+# the order of `candidates` -- this function never re-ranks; each selection
+# path keeps its own existing ranking algorithm (density here, confidence+
+# score in the fixed-window loop) in both legacy and adaptive mode, since
+# nothing in the adaptive-selection requirements calls for changing ranking.
 # ---------------------------------------------------------------------------
-def select_regions(regions, target_duration, duration_mode="MAX"):
+def select_regions_bounded(
+    candidates,
+    budget,
+    duration_mode="MAX",
+    clip_count_min=0,
+    clip_count_max=None,
+    overflow_pct=0.0,
+    segments=None,
+    segment_cap=None,
+):
     """
-    Greedy: pick highest-density regions first, skipping any that TRULY overlap
-    (share time) with an already-selected one. Abutting clips (split sub-windows)
-    are allowed so they can fill the budget back-to-back.
+    Greedy selection over pre-ranked candidates, filling `budget` with the
+    same overlap/truncation/EXACT-cutoff semantics as `select_regions` (and,
+    for integer-boundary windows, the fixed-window loop in pipeline.py) --
+    plus, when the corresponding parameter is non-default, three additional
+    behaviors: a minimum/maximum clip count, one-candidate budget overflow
+    tolerance, and soft per-segment caps that relax when the minimum can't
+    otherwise be met.
+
+    Parameters
+    ----------
+    candidates : list of Region, already ranked by the caller (highest
+        priority first). Overlap is resolved by candidate order, not score.
+    budget : float -- seconds.
+    duration_mode : "MAX" or "EXACT" -- same meaning as select_regions.
+    clip_count_min : int -- supplement past budget until this many clips are
+        selected (0 = no supplementing, matching legacy).
+    clip_count_max : int or None -- stop even with budget remaining once this
+        many clips are selected (None = unbounded, matching legacy).
+    overflow_pct : float -- allow at most one candidate to push total
+        duration up to budget*(1+overflow_pct) (0.0 = no overflow, matching
+        legacy -- the hard `remaining <= 0` cutoff select_regions/the
+        fixed-window loop already use).
+    segments : list of (start, end) tuples or None -- 30-min buckets (or
+        caller-defined spans) for distribution; None disables segment logic
+        entirely, matching legacy.
+    segment_cap : int or None -- max clips per segment when segments is set.
+
+    Returns
+    -------
+    selected : list of Region, sorted chronologically.
+    rejected : list of (Region, reason) for R11-style logging -- reason is
+        one of "overlap", "clip_count_max reached", "segment cap",
+        "budget exhausted".
     """
-    if not regions:
+    if not candidates:
         return [], []
 
-    def _shares_time(a, b):
-        return min(a.end, b.end) - max(a.start, b.start) > 0.0
+    def _segment_index(c):
+        if not segments:
+            return None
+        for i, (s, e) in enumerate(segments):
+            if s <= c.start < e:
+                return i
+        return len(segments) - 1  # trailing candidates clamp to the last segment
 
-    for r in regions:
-        r._density = r.score / max(0.5, r.duration)
-
-    ranked = sorted(regions, key=lambda r: (r._density, r.score), reverse=True)
+    max_clips = clip_count_max if clip_count_max is not None else float("inf")
+    segment_caps_active = segments is not None and segment_cap is not None
 
     selected = []
-    total_dur = 0.0
-    for r in ranked:
-        if any(_shares_time(r, sel) for sel in selected):
-            continue
-        remaining = target_duration - total_dur
-        if remaining <= 0:
+    rejected = []
+    total = 0.0
+    overflow_used = False
+    seg_counts = {}
+
+    for pos, c in enumerate(candidates):
+        if len(selected) >= max_clips:
+            # No later candidate can ever be selected once the cap is hit --
+            # bulk-reject the remainder instead of scanning one at a time
+            # (a long EXACT-mode candidate list can be tens of thousands of
+            # per-second Regions).
+            rejected.extend((cc, "clip_count_max reached") for cc in candidates[pos:])
             break
-        actual_end = r.end
-        if r.duration > remaining:
-            actual_end = r.start + remaining
-        selected.append(Region(r.start, actual_end, r.score, r.sources))
-        total_dur += actual_end - r.start
-        if duration_mode == "EXACT" and total_dur >= target_duration:
+        if any(_shares_time(c, s) for s in selected):
+            rejected.append((c, "overlap"))
+            continue
+
+        seg_idx = _segment_index(c) if segment_caps_active else None
+        if segment_caps_active and seg_idx is not None and seg_counts.get(seg_idx, 0) >= segment_cap:
+            if len(selected) >= clip_count_min:
+                # Cheap check first -- avoid the O(remaining candidates) scan
+                # below on the common path where the minimum is already met.
+                rejected.append((c, "segment cap"))
+                continue
+            others_available = any(
+                _segment_index(o) != seg_idx
+                and seg_counts.get(_segment_index(o), 0) < segment_cap
+                and not any(_shares_time(o, s) for s in selected)
+                for o in candidates[pos + 1:]
+            )
+            if others_available:
+                rejected.append((c, "segment cap"))
+                continue
+            # else: last resort (R9) -- take it despite the cap
+
+        remaining = budget - total
+        if remaining <= 0:
+            if overflow_pct > 0 and not overflow_used and total <= budget * (1 + overflow_pct):
+                overflow_used = True
+                # Cap the overflow candidate at the overflow ceiling instead
+                # of taking its full duration -- otherwise a single large
+                # candidate can blow past the promised 10% overflow bound
+                # by an arbitrary amount.
+                remaining = max(0.0, budget * (1 + overflow_pct) - total)
+            elif len(selected) >= clip_count_min:
+                rejected.append((c, "budget exhausted"))
+                break
+            # else: under the minimum -- fall through and take this
+            # candidate as a supplement past budget (R6); remaining stays
+            # <=0 here so it's taken at full duration (no truncation --
+            # truncation only applies when remaining is a positive cap)
+
+        actual = c
+        if remaining > 0 and c.duration > remaining:
+            actual = Region(c.start, c.start + remaining, c.score, c.sources)
+
+        selected.append(actual)
+        total += actual.duration
+        if seg_idx is not None:
+            seg_counts[seg_idx] = seg_counts.get(seg_idx, 0) + 1
+
+        if duration_mode == "EXACT" and total >= budget:
             break
 
     selected.sort(key=lambda r: r.start)
-    return [(r.start, r.end) for r in selected], selected
+    return selected, rejected
+
+
+# ---------------------------------------------------------------------------
+# 7c. Fixed-window candidate construction + selection -- the CLIP_TIME > 0
+# counterpart to build_auto_segments (section 8 below). Builds one
+# fixed-duration Region per candidate second (ranked by confidence-then-score,
+# matching pipeline.py's original fixed-window loop exactly), then selects
+# through select_regions_bounded. With clip_count_min=0, clip_count_max=None,
+# overflow_pct=0.0, segments=None (this function's defaults), the result is
+# byte-identical to that original loop -- see
+# tests/test_auto_segments.py::test_fixed_window_legacy_defaults_match_original_loop.
+# ---------------------------------------------------------------------------
+def select_fixed_window_segments(
+    score,
+    video_duration,
+    target_duration,
+    duration_mode,
+    clip_time,
+    detections_by_sec=None,
+    clip_count_min=0,
+    clip_count_max=None,
+    overflow_pct=0.0,
+    segments=None,
+    segment_cap=None,
+):
+    """
+    Parameters mirror pipeline.py's original fixed-window loop:
+    score : np.ndarray -- per-second score array.
+    video_duration : float
+    target_duration : float -- the resolved budget (fixed max_duration/
+        exact_duration, or an adaptive tier budget).
+    duration_mode : "EXACT" or "MAX".
+    clip_time : int -- fixed window size in seconds (CLIP_TIME).
+    detections_by_sec : dict {sec: [(name, conf), ...]} or None.
+    clip_count_min/max, overflow_pct, segments, segment_cap : see
+        select_regions_bounded -- pass-through, defaulting to legacy (no
+        constraint) behavior.
+
+    Returns
+    -------
+    segments_out : list of (start, end) tuples, sorted chronologically.
+    rejected : list of (Region, reason) -- see select_regions_bounded.
+    """
+    detections_by_sec = detections_by_sec or {}
+
+    if duration_mode == "EXACT":
+        candidate_indices = np.arange(len(score))
+    else:
+        candidate_indices = np.where(score > 0)[0]
+
+    if len(candidate_indices) == 0:
+        return [], []
+
+    candidate_scores = score[candidate_indices]
+    candidate_confidences = np.zeros(len(candidate_indices))
+    for idx, sec in enumerate(candidate_indices):
+        if sec in detections_by_sec:
+            candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
+
+    sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))
+    top_indices_all = candidate_indices[sorted_indices]
+
+    ranked_candidates = []
+    for sec in top_indices_all:
+        start = max(0, sec - clip_time // 2)
+        end = min(video_duration, start + clip_time)
+        if end - start < clip_time and end < video_duration:
+            end = min(video_duration, start + clip_time)
+        if end - start < clip_time and start > 0:
+            start = max(0, end - clip_time)
+        ranked_candidates.append(Region(start, end, float(score[sec])))
+
+    selected, rejected = select_regions_bounded(
+        ranked_candidates, budget=target_duration, duration_mode=duration_mode,
+        clip_count_min=clip_count_min, clip_count_max=clip_count_max,
+        overflow_pct=overflow_pct, segments=segments, segment_cap=segment_cap,
+    )
+    return [(r.start, r.end) for r in selected], rejected
+
 
 # ---------------------------------------------------------------------------
 # 8. Main entry point
@@ -372,6 +568,11 @@ def build_auto_segments(
     min_clip=1.5,
     max_clip=30.0,
     merge_gap=1.5,
+    clip_count_min=0,
+    clip_count_max=None,
+    overflow_pct=0.0,
+    segments_bounds=None,
+    segment_cap=None,
     log_fn=print,
 ):
     """
@@ -392,6 +593,10 @@ def build_auto_segments(
     min_clip : float — minimum region duration after constraining
     max_clip : float — maximum single region duration
     merge_gap : float — merge regions within this many seconds
+    clip_count_min/clip_count_max, overflow_pct, segments_bounds, segment_cap :
+        adaptive-mode selection constraints, passed through to
+        select_regions_bounded. Defaults reproduce the pre-adaptive behavior
+        exactly (no clip-count bound, no overflow, no segment distribution).
     log_fn : callable
 
     Returns
@@ -460,14 +665,26 @@ def build_auto_segments(
            f"(min={min_clip}s, max={max_clip}s)")
 
     # --- Step 4: Select best non-overlapping regions within budget ---
-    segments, selected_regions = select_regions(constrained, target_duration, duration_mode)
+    # Pre-rank by density (score/duration) then score, matching select_regions'
+    # own ranking -- select_regions_bounded never re-ranks internally, so
+    # legacy defaults here reproduce select_regions() exactly (see
+    # tests/test_auto_segments.py::test_legacy_defaults_match_select_regions_exactly).
+    for r in constrained:
+        r._density = r.score / max(0.5, r.duration)
+    ranked = sorted(constrained, key=lambda r: (r._density, r.score), reverse=True)
+    selected_regions, rejected_regions = select_regions_bounded(
+        ranked, target_duration, duration_mode=duration_mode,
+        clip_count_min=clip_count_min, clip_count_max=clip_count_max,
+        overflow_pct=overflow_pct, segments=segments_bounds, segment_cap=segment_cap,
+    )
+    segments = [(r.start, r.end) for r in selected_regions]
 
     total_dur = sum(e - s for s, e in segments)
     log_fn(f"   Selected {len(segments)} segments, total {total_dur:.1f}s "
            f"(target: {target_duration}s, mode: {duration_mode})")
+    log_rejected_segments(log_fn, rejected_regions)
 
     # --- Debug: show what was selected ---
-    from collections import Counter
     for i, reg in enumerate(selected_regions):
         s_mm = f"{int(reg.start)//60:02d}:{int(reg.start)%60:02d}"
         e_mm = f"{int(reg.end)//60:02d}:{int(reg.end)%60:02d}"

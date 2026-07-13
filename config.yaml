@@ -7,6 +7,20 @@ highlights:
   exact_duration: 0
   keep_temp: false
   skip_highlights: false
+  # Adaptive Top-X selection (opt-in; "fixed" preserves max_duration/exact_duration
+  # behavior above unchanged). selection_mode: adaptive sizes the highlight budget
+  # from source video duration via the tier list below, instead of a flat max_duration.
+  selection_mode: fixed
+  clip_count_min: 3
+  clip_count_max: 20
+  overflow_pct: 0.10
+  segment_distribution_enabled: false
+  segment_minutes: 30
+  segment_cap: null
+  tiers:
+  - {max_source_duration: 3600, percentage: 0.10, min_duration: 120, max_duration: 600}
+  - {max_source_duration: 14400, percentage: 0.05, min_duration: 300, max_duration: 1200}
+  - {max_source_duration: null, percentage: 0.025, min_duration: 300, max_duration: 1800}
 scoring:
   scene_points: 0
   motion_event_points: 0

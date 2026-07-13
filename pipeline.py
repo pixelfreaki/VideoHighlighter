@@ -22,7 +22,8 @@ from modules.video_cache import (
     CHECKPOINTED_STAGES, resolve_completed_stages,
 )
 from modules.video_cutter import cut_video
-from modules.auto_segments import build_auto_segments
+from modules.auto_segments import build_auto_segments, select_fixed_window_segments, log_rejected_segments
+from modules.highlight_budget import resolve_selection_constraints, DEFAULT_MAX_DURATION
 from modules.device_utils import resolve_yolo_device, detect_best_device, should_export_yolo_to_openvino
 from modules.app_paths import ffmpeg_exe
 from modules.perf_summary import emit_summary
@@ -475,7 +476,7 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
 
         # Merge CLI/gui-style values with defaults
         OUTPUT_FILE = gui_config.get("output_file") or config.get("video", {}).get("output", "highlight.mp4")
-        MAX_DURATION = gui_config.get("max_duration") or config.get("highlights", {}).get("max_duration", 420)
+        MAX_DURATION = gui_config.get("max_duration") or config.get("highlights", {}).get("max_duration", DEFAULT_MAX_DURATION)
         EXACT_DURATION = gui_config.get("exact_duration") or config.get("highlights", {}).get("exact_duration", None)
         CLIP_TIME = gui_config.get("clip_time") or config.get("highlights", {}).get("clip_time", 10)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
@@ -510,9 +511,10 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         KEYWORD_SCORING_MODE = MODE_ADVANCED if ADVANCED_SCORING_ENABLED else MODE_SIMPLE
         KEYWORD_SCORE_BY_SECOND = {}
 
-        target_duration = EXACT_DURATION if EXACT_DURATION else MAX_DURATION
-        duration_mode = "EXACT" if EXACT_DURATION else "MAX"
-        log(f"🎯 Mode: {duration_mode} duration of {target_duration} seconds ({target_duration/60:.1f} minutes)")
+        # target_duration/duration_mode are resolved after video_duration is
+        # finalized below (post time-range trim) -- see "Adaptive highlight
+        # selection budget" further down. Placeholder values here are never
+        # read; nothing between this point and that resolution consumes them.
 
         # ── Hard gate: actions require objects but no objects configured ─────────────
         actions_require_objects = gui_config.get("actions_require_objects", False)
@@ -650,6 +652,38 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
         else:
             log("ℹ️ Processing full video")
         progress.end_stage("trim")
+
+        # ========== Adaptive highlight selection budget ==========
+        # Resolved here (not earlier) because it must use the final,
+        # post-time-range-trim video_duration -- the actual pool of
+        # selectable content, not the raw file length (KTD/Assumptions:
+        # source_duration = analyzed range). All derivation logic lives in
+        # resolve_selection_constraints (modules/highlight_budget.py) so it's
+        # unit-tested without this function's heavy ML import chain; legacy
+        # mode is guaranteed there to zero every adaptive setting regardless
+        # of config (R14).
+        _selection = resolve_selection_constraints(gui_config, config, video_duration)
+        SELECTION_MODE = _selection["selection_mode"]
+        target_duration = _selection["target_duration"]
+        duration_mode = _selection["duration_mode"]
+        CLIP_COUNT_MIN = _selection["clip_count_min"]
+        CLIP_COUNT_MAX = _selection["clip_count_max"]
+        OVERFLOW_PCT = _selection["overflow_pct"]
+        SEGMENT_BOUNDS = _selection["segment_bounds"]
+        SEGMENT_CAP = _selection["segment_cap"]
+
+        if SELECTION_MODE == "adaptive" and duration_mode != "EXACT":
+            _tier = _selection["tier"]
+            tier_desc = (f"tier pct={_tier.get('percentage')} "
+                         f"bounds=[{_tier.get('min_duration')},{_tier.get('max_duration')}]"
+                         if _tier else "no tiers configured -- fixed-mode default")
+            log(f"🎯 Adaptive budget: {duration_mode} duration of {target_duration:.0f}s "
+                f"({target_duration/60:.1f} min) for a {video_duration:.0f}s source -- {tier_desc}")
+        elif SELECTION_MODE == "adaptive":
+            log(f"🎯 Adaptive budget: EXACT duration of {target_duration:.0f}s "
+                f"({target_duration/60:.1f} min) -- exact_duration override")
+        else:
+            log(f"🎯 Mode: {duration_mode} duration of {target_duration} seconds ({target_duration/60:.1f} minutes)")
 
         # ========== CACHE CHECK ==========
         # Goal:
@@ -1976,61 +2010,29 @@ def _run_highlighter_impl(video_path, sample_rate=5, gui_config: dict = None,
                 min_clip=float(gui_config.get("auto_min_clip", 1.5)),
                 max_clip=float(gui_config.get("auto_max_clip", 30.0)),
                 merge_gap=float(gui_config.get("auto_merge_gap", 1.5)),
+                clip_count_min=CLIP_COUNT_MIN, clip_count_max=CLIP_COUNT_MAX,
+                overflow_pct=OVERFLOW_PCT, segments_bounds=SEGMENT_BOUNDS, segment_cap=SEGMENT_CAP,
                 log_fn=log,
             )
             
         else:
-            # ========== FIXED-WINDOW MODE (original logic) ==========
-            # Only use scored seconds depending on mode
-            if duration_mode == "EXACT":
-                candidate_indices = np.arange(len(score))
-            else:
-                candidate_indices = np.where(score > 0)[0]
-
-            candidate_scores = score[candidate_indices]
-
-            candidate_confidences = np.zeros(len(candidate_indices))
-            for idx, sec in enumerate(candidate_indices):
-                if sec in detections_by_sec:
-                    candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
-
-            sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))
-            top_indices_all = candidate_indices[sorted_indices]
-
-            segments = []
-            used_seconds = set()
-
-            for sec in top_indices_all:
-                if sec in used_seconds:
-                    continue
-
-                start = max(0, sec - CLIP_TIME // 2)
-                end = min(video_duration, start + CLIP_TIME)
-
-                if end - start < CLIP_TIME and end < video_duration:
-                    end = min(video_duration, start + CLIP_TIME)
-                if end - start < CLIP_TIME and start > 0:
-                    start = max(0, end - CLIP_TIME)
-
-                if any(s in used_seconds for s in range(int(start), int(end))):
-                    continue
-
-                current_duration = sum(e - s for s, e in segments)
-                remaining = target_duration - current_duration
-                if remaining <= 0:
-                    break
-                if end - start > remaining:
-                    end = start + remaining
-
-                segments.append((start, end))
-                for s in range(int(start), int(end)):
-                    used_seconds.add(s)
-
-                current_duration = sum(e - s for s, e in segments)
-                if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
-                    break
-                elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
-                    break
+            # ========== FIXED-WINDOW MODE ==========
+            # Candidate window construction, ranking, and greedy selection
+            # live in select_fixed_window_segments (modules/auto_segments.py)
+            # -- with legacy defaults (clip_count_min=0, clip_count_max=None,
+            # overflow_pct=0.0, segments=None) this reproduces the original
+            # inline loop byte-for-byte; see
+            # tests/test_auto_segments.py::test_fixed_window_legacy_defaults_match_original_loop_*.
+            # Comparisons against target_duration (not the raw EXACT_DURATION/
+            # MAX_DURATION globals) so adaptive-computed budgets are honored
+            # identically to fixed-mode budgets.
+            segments, rejected_fixed = select_fixed_window_segments(
+                score, video_duration, target_duration, duration_mode, CLIP_TIME,
+                detections_by_sec=detections_by_sec,
+                clip_count_min=CLIP_COUNT_MIN, clip_count_max=CLIP_COUNT_MAX,
+                overflow_pct=OVERFLOW_PCT, segments=SEGMENT_BOUNDS, segment_cap=SEGMENT_CAP,
+            )
+            log_rejected_segments(log, rejected_fixed)
 
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
