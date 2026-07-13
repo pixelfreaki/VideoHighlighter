@@ -68,14 +68,22 @@ def latest_custom_pose_model():
     roots = {_project_root(), user_data_dir()}
     candidates = []
     for root in roots:
-        # explicit drop-in
+        # explicit drop-in (unconditional -- the user placed it deliberately)
         for name in ("custom_keypoints.pt",):
             p = os.path.join(root, name)
             if os.path.exists(p):
                 candidates.append(p)
-        # ultralytics training outputs
-        candidates += glob.glob(os.path.join(root, "**", "weights", "best.pt"), recursive=True)
-        candidates += glob.glob(os.path.join(root, "training", "**", "weights", "best.pt"), recursive=True)
+        # ultralytics training outputs -- pose runs only. train_yolo.py writes
+        # a keypoint_names.json sidecar next to its best.pt; object-detection
+        # runs (train_object.py) write classes.json instead. Requiring the
+        # pose sidecar keeps a freshly trained detector from hijacking
+        # pose-model resolution via this task-blind glob.
+        found = glob.glob(os.path.join(root, "**", "weights", "best.pt"), recursive=True)
+        found += glob.glob(os.path.join(root, "training", "**", "weights", "best.pt"), recursive=True)
+        candidates += [
+            c for c in found
+            if os.path.exists(os.path.join(os.path.dirname(c), "keypoint_names.json"))
+        ]
     candidates = [c for c in candidates if os.path.exists(c)]
     if not candidates:
         return None

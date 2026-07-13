@@ -46,6 +46,13 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+# Editor model is stdlib-only (safe at import time); the panel is pure Qt.
+# modules.keyword_scoring (whisper chain) is never imported at module level —
+# the editor's persist gate lazy-imports it.
+from modules.keyword_scoring_editor import (
+    import_simple_keywords, parse_section, resolve_section_for_save,
+)
+from video_ai_editor.keyword_scoring_panel import AdvancedScoringPanel
 
 try:
     import openvino  # registers OpenVINO's DLL dir on Windows
@@ -1342,6 +1349,37 @@ class VideoHighlighterGUI(QWidget):
         self.search_keywords_input.setPlaceholderText("goal, score, win")
         self.search_keywords_input.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow("Search keywords:", self.search_keywords_input)
+
+        # Shown while advanced scoring owns matching (R6); hidden otherwise
+        self.simple_keywords_note = QLabel(
+            "Ignored while Advanced keyword scoring is enabled — matching uses the groups below."
+        )
+        self.simple_keywords_note.setStyleSheet("color: #888; font-size: 10px;")
+        self.simple_keywords_note.setWordWrap(True)
+        self.simple_keywords_note.setVisible(False)
+        transcript_form.addRow("", self.simple_keywords_note)
+
+        # Advanced keyword scoring editor (keywords.advanced_scoring).
+        # parse_section never raises: a malformed section renders the panel's
+        # resettable parse-error card instead of breaking startup.
+        adv_model, adv_flags = parse_section(self.config_data)
+        self.advanced_scoring_panel = AdvancedScoringPanel(adv_model, adv_flags)
+        transcript_form.addRow(self.advanced_scoring_panel)
+        # Debounced write-through (KTD2): save_config() rewrites the whole
+        # file, so rapid panel edits coalesce; run_pipeline() flushes.
+        self._adv_save_timer = QTimer(self)
+        self._adv_save_timer.setSingleShot(True)
+        self._adv_save_timer.setInterval(400)
+        self._adv_save_timer.timeout.connect(self.save_config)
+        self.advanced_scoring_panel.master_toggled.connect(self.on_advanced_scoring_toggle)
+        self.advanced_scoring_panel.section_changed.connect(self.on_advanced_scoring_changed)
+        self.advanced_scoring_panel.import_requested.connect(self.on_import_simple_keywords)
+        self.search_keywords_input.textChanged.connect(self.refresh_import_button)
+        # Both-paths-in-sync: apply the grey-out and import-button state without
+        # a signal round-trip (construction never emits the panel's signals).
+        self.on_advanced_scoring_toggle(bool(adv_model.get("enabled", False)))
+        self.refresh_import_button()
+
         transcript_group.setLayout(transcript_form)
         transcript_layout.addWidget(transcript_group)
 
@@ -1410,13 +1448,23 @@ class VideoHighlighterGUI(QWidget):
 
         self.yolo_type_combo = QComboBox()
         self.yolo_type_combo.addItem("Standard YOLOX (80 objects, fast, OpenVINO support)", "standard")
-
-        # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
-        self._custom_pose_model = None
+        self.yolo_type_combo.addItem("Custom model (trained detector)", "custom")
 
         current_type = advanced_cfg.get("yolo_type", "standard")
         idx_type = self.yolo_type_combo.findData(current_type)
         self.yolo_type_combo.setCurrentIndex(idx_type if idx_type >= 0 else 0)
+
+        # Custom detector path (train one with training/train_object.py).
+        # Enabled only in custom mode; empty text means "unset" and coerces to
+        # None in _custom_model_path() so the gui_config None-strip drops it.
+        self.custom_model_input = QLineEdit()
+        self.custom_model_input.setPlaceholderText("Path to trained best.pt...")
+        self.custom_model_input.setText(str(advanced_cfg.get("yolo_custom_model_path") or ""))
+        self.browse_custom_model_btn = QPushButton("Browse...")
+        self.browse_custom_model_btn.clicked.connect(self.browse_custom_model)
+        custom_model_row = QHBoxLayout()
+        custom_model_row.addWidget(self.custom_model_input)
+        custom_model_row.addWidget(self.browse_custom_model_btn)
 
         self.yolo_model_combo = QComboBox()
 
@@ -1429,8 +1477,12 @@ class VideoHighlighterGUI(QWidget):
             custom_only = (yolo_type == "custom")
 
             if custom_only:
-                # Size applies to the object detector, which isn't used here
-                self.yolo_model_combo.addItem("(custom model — size N/A)", "n")
+                # Size applies to the object detector, which isn't used here.
+                # The placeholder carries the previously selected size so a
+                # config save in custom mode round-trips yolo_model_size
+                # unchanged and standard mode restores the user's choice.
+                kept_size = prev_size or advanced_cfg.get("yolo_model_size", "n")
+                self.yolo_model_combo.addItem("(custom model — size N/A)", kept_size)
                 self.yolo_model_combo.setEnabled(False)
             else:
                 self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
@@ -1444,6 +1496,9 @@ class VideoHighlighterGUI(QWidget):
             if restore_idx >= 0:
                 self.yolo_model_combo.setCurrentIndex(restore_idx)
             self.yolo_model_combo.blockSignals(False)
+
+            self.custom_model_input.setEnabled(custom_only)
+            self.browse_custom_model_btn.setEnabled(custom_only)
 
         self.yolo_type_combo.currentIndexChanged.connect(on_yolo_type_changed)
 
@@ -1460,6 +1515,7 @@ class VideoHighlighterGUI(QWidget):
 
         object_layout.addRow("Frame skip:", self.obj_frame_skip_spin)
         object_layout.addRow("Detector type:", self.yolo_type_combo)
+        object_layout.addRow("Custom model:", custom_model_row)
         object_layout.addRow("Detector model size:", self.yolo_model_combo)
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
 
@@ -2382,7 +2438,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": self._custom_model_path(),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
@@ -2856,6 +2912,31 @@ class VideoHighlighterGUI(QWidget):
                 return []
             return [s.strip() for s in text.split(",") if s.strip()]
 
+        # Advanced keyword scoring routes through the single merge choke point
+        # (R10): panel state only when it parsed clean and passes the persist
+        # gate; otherwise the on-disk subtree passes through verbatim, so the
+        # wholesale rewrite below can never drop the section (ui-section
+        # precedent). getattr guard: save can run before the tab is built.
+        panel = getattr(self, "advanced_scoring_panel", None)
+        if panel is not None:
+            advanced_scoring = resolve_section_for_save(
+                panel.current_model(),
+                panel.coercion_flags(),
+                self.config_data,
+                gate_ok=panel.is_gate_ok(),
+            )
+            if (not panel.has_parse_error()
+                    and panel.is_enabled()
+                    and not panel.is_gate_ok()):
+                # KTD3: enabled-and-invalid never blocks a save (or close) —
+                # but say that the last-valid on-disk section was kept.
+                self.append_log(
+                    "⚠️ Advanced keyword scoring: enabled with validation errors — "
+                    "keeping the last-valid section in config.yaml"
+                )
+        else:
+            advanced_scoring = resolve_section_for_save(None, None, self.config_data)
+
         data = {
             "video": {"paths": self.get_file_list()},
             "download": {
@@ -2908,6 +2989,7 @@ class VideoHighlighterGUI(QWidget):
             "keywords": {
                 "transcript_file": "transcript.txt",
                 "interesting": get_text_list(self.search_keywords_input),
+                "advanced_scoring": advanced_scoring,
             },
             "transcript": {
                 "enabled": self.transcript_checkbox.isChecked(),
@@ -2927,6 +3009,7 @@ class VideoHighlighterGUI(QWidget):
                 "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_type": self.yolo_type_combo.currentData(),
                 "yolo_model_size": self.yolo_model_combo.currentData(),
+                "yolo_custom_model_path": self._custom_model_path(),
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
                 "action_models": self.action_models_combo.currentData(),
@@ -2971,7 +3054,7 @@ class VideoHighlighterGUI(QWidget):
         """Handle transcript checkbox toggle"""
         self.transcript_source_lang.setEnabled(checked)
         self.transcript_model_combo.setEnabled(checked)
-        self.search_keywords_input.setEnabled(checked)
+        self._sync_search_keywords_enabled()
         self.subtitles_checkbox.setEnabled(checked)
         
         # If transcript is disabled, also disable subtitles
@@ -2984,9 +3067,73 @@ class VideoHighlighterGUI(QWidget):
         # Subtitles can only be enabled if transcript is enabled
         transcript_enabled = self.transcript_checkbox.isChecked()
         final_state = checked and transcript_enabled
-        
+
         self.subtitle_source_lang.setEnabled(final_state)
         self.subtitle_target_lang.setEnabled(final_state)
+
+    def _sync_search_keywords_enabled(self):
+        """R6: the simple list is editable only while transcript is on and
+        advanced scoring is not the active matcher; the note shows while it is."""
+        advanced_on = self.advanced_scoring_panel.is_enabled()
+        self.search_keywords_input.setEnabled(
+            self.transcript_checkbox.isChecked() and not advanced_on
+        )
+        self.simple_keywords_note.setVisible(advanced_on)
+
+    def on_advanced_scoring_toggle(self, _checked):
+        """Handle advanced-scoring master toggle (R6)."""
+        self._sync_search_keywords_enabled()
+
+    def on_advanced_scoring_changed(self, section, gate_ok):
+        """Write-through persistence for keywords.advanced_scoring (R8).
+
+        Every committed panel edit lands here: if the persist gate passes
+        (toggle off, or enabled and valid), mirror the section into
+        config_data and schedule the config.yaml write; if blocked, leave
+        memory and disk untouched — the panel already renders the errors.
+        The write is debounced: save_config() rebuilds and rewrites the whole
+        file, so rapid chip edits coalesce into one write. Run and close both
+        flush — run_pipeline() flushes the timer, and closeEvent's save_config
+        re-emits the section from panel state regardless."""
+        if gate_ok:
+            if not isinstance(self.config_data.get("keywords"), dict):
+                self.config_data["keywords"] = {}
+            self.config_data["keywords"]["advanced_scoring"] = section
+            self._adv_save_timer.start()
+        else:
+            errors = self.advanced_scoring_panel.current_errors()
+            self.append_log(
+                f"⚠️ Advanced keyword scoring: {len(errors)} validation error(s) — "
+                "config.yaml not updated (fix them or disable the toggle to save WIP)"
+            )
+
+    def on_import_simple_keywords(self):
+        """One-shot migration of the simple keyword list into a group (R11)."""
+        words = [s.strip() for s in self.search_keywords_input.text().split(",") if s.strip()]
+        if not words:
+            return
+        keyword_points = int(self.spin_keyword_points.value())
+        existing_ids = [g.get("id") for g in self.advanced_scoring_panel.current_model().get("groups") or []]
+        group = import_simple_keywords(words, keyword_points, existing_ids)
+        self.advanced_scoring_panel.add_group(group)
+        self.append_log(
+            f"✅ Imported {len(group['words'])} keyword(s) into group "
+            f"'{group['id']}' (weight {keyword_points})"
+        )
+
+    def refresh_import_button(self, _text=""):
+        """Import needs a non-empty simple keyword list (R11)."""
+        has_words = bool([s for s in self.search_keywords_input.text().split(",") if s.strip()])
+        if has_words:
+            self.advanced_scoring_panel.set_import_enabled(
+                True,
+                "Create a new group from the simple search-keywords list, "
+                "weighted at the current keyword points value.",
+            )
+        else:
+            self.advanced_scoring_panel.set_import_enabled(
+                False, "Simple search-keywords list is empty — nothing to import"
+            )
 
     # --- Labels ---
     def load_labels_from_json(self, filepath):
@@ -3019,6 +3166,21 @@ class VideoHighlighterGUI(QWidget):
                 self.append_log(f"❌ Failed to load labels from {filepath}: {e}")
                 return []
 
+    def _custom_model_path(self):
+        """Selected custom detector path, or None when unset. Empty text must
+        coerce to None so the gui_config None-stripping filters drop the key
+        (pipeline falls back to its own defaults on a missing key)."""
+        text = self.custom_model_input.text().strip()
+        return text or None
+
+    def browse_custom_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select trained YOLO model",
+            self.custom_model_input.text() or "models",
+            "YOLO model (*.pt)")
+        if path:
+            self.custom_model_input.setText(path)
+
     def open_object_label_selector(self):
         """Open label selector. For the custom model this offers your trained
         class names; for 'mixed' it merges those with the COCO objects;
@@ -3027,13 +3189,25 @@ class VideoHighlighterGUI(QWidget):
 
         labels = []
         if "custom" in yolo_type:
-            try:
-                from modules.app_paths import custom_keypoint_names
-                labels = custom_keypoint_names()
-            except Exception:
-                labels = []
+            # Detect models: classes.json sidecar written by train_object.py
+            # (torch-free, mirrors how COCO names come from a JSON resource).
+            model_path = self._custom_model_path()
+            if model_path:
+                try:
+                    from modules.dataset_library import read_classes_sidecar
+                    labels = read_classes_sidecar(model_path)
+                except Exception:
+                    labels = []
             if not labels:
-                self.append_log("⚠️ No custom keypoint names found (train a model / check labels).")
+                # Pose models: keypoint-names sidecar path
+                try:
+                    from modules.app_paths import custom_keypoint_names
+                    labels = custom_keypoint_names()
+                except Exception:
+                    labels = []
+            if not labels:
+                self.append_log("⚠️ No class names found for the custom model "
+                                "(expected classes.json next to the .pt).")
 
         if yolo_type != "custom":  # standard or mixed -> include COCO objects
             if os.path.exists(YOLO_OBJECTS_LABELS_FILE):
@@ -3535,7 +3709,28 @@ class VideoHighlighterGUI(QWidget):
         if self.worker and self.worker.isRunning():
             self.append_log("⚠️ Pipeline already running!")
             return
-        
+
+        # --- Advanced keyword scoring gate (R8/KTD3) ---
+        # Never start with an enabled-but-invalid section; this single check
+        # covers the Run button and auto_start_pipeline (both call here).
+        panel = getattr(self, "advanced_scoring_panel", None)
+        if panel is not None and self._adv_save_timer.isActive():
+            # Flush the debounced write-through: the pipeline re-reads
+            # config.yaml from disk, so pending edits must land first.
+            self._adv_save_timer.stop()
+            self.save_config()
+        if (panel is not None
+                and panel.is_enabled()
+                and not panel.is_gate_ok()):
+            errors = panel.current_errors()
+            self.append_log(
+                f"❌ Advanced keyword scoring has {len(errors)} validation error(s) — "
+                "fix them (or disable the toggle) before running:"
+            )
+            for error in errors:
+                self.append_log(f"  ⚠️ {error.get('message', error)}")
+            return
+
         # --- Validate scoring points ---
         scene_points = int(self.spin_scene_points.value())
         motion_event_points = int(self.spin_motion_event_points.value())
@@ -3650,7 +3845,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": self._custom_model_path(),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),

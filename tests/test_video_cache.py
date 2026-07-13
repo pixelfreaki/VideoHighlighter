@@ -506,3 +506,47 @@ def test_realistic_config_shape_with_advanced_scoring_absent_is_disabled():
     )
 
     assert params["advanced_scoring"] == {"enabled": False}
+
+
+# ---------------------------------------------------------------------------
+# Custom-detector signature coverage -- yolo_type / yolo_custom_model_path are
+# match-affecting (they change which detector produced the detections) but are
+# included only in custom mode so standard-mode signatures stay byte-identical
+# to the pre-custom shape (existing caches remain valid).
+# ---------------------------------------------------------------------------
+
+def test_analysis_params_same_config_is_stable():
+    a = build_analysis_cache_params({}, {}, sample_rate=5, video_duration=60.0)
+    b = build_analysis_cache_params({}, {}, sample_rate=5, video_duration=60.0)
+    assert a == b
+
+
+def test_standard_mode_params_contain_no_custom_keys():
+    for gui_config in ({}, {"yolo_type": "standard"},
+                       {"yolo_type": "standard", "yolo_custom_model_path": None}):
+        params = build_analysis_cache_params(gui_config, {}, sample_rate=5,
+                                             video_duration=60.0)
+        assert "yolo_type" not in params
+        assert "yolo_custom_model_path" not in params
+
+
+def test_custom_mode_changes_signature_params():
+    standard = build_analysis_cache_params(
+        {"yolo_type": "standard"}, {}, sample_rate=5, video_duration=60.0)
+    custom = build_analysis_cache_params(
+        {"yolo_type": "custom", "yolo_custom_model_path": "models/a/best.pt"},
+        {}, sample_rate=5, video_duration=60.0)
+    assert standard != custom
+    assert custom["yolo_type"] == "custom"
+    assert custom["yolo_custom_model_path"] == "models/a/best.pt"
+
+
+def test_different_custom_model_paths_differ():
+    base = {"yolo_type": "custom"}
+    a = build_analysis_cache_params(
+        {**base, "yolo_custom_model_path": "models/theat/best.pt"}, {},
+        sample_rate=5, video_duration=60.0)
+    b = build_analysis_cache_params(
+        {**base, "yolo_custom_model_path": "models/library/best.pt"}, {},
+        sample_rate=5, video_duration=60.0)
+    assert a != b

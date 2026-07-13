@@ -16,3 +16,10 @@ yolo11*_openvino_model
 yolov8*-worldv2.pt
 config/*
 object_log.csv
+# YOLO dataset library (training data, not committed)
+datasets/
+
+# training outputs and model weights (not committed)
+models/
+runs/
+*.pt
