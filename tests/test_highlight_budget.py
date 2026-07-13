@@ -145,3 +145,105 @@ def test_resolve_selection_constraints_gui_config_overrides_yaml():
     result = hb.resolve_selection_constraints(gui_config, config, video_duration=2700)
     assert result["selection_mode"] == "adaptive"
     assert result["target_duration"] == pytest.approx(270.0)
+
+
+# --- malformed-config resilience (review findings) --------------------------
+
+def test_resolve_tier_skips_non_dict_entries():
+    tiers = ["not-a-tier", {"max_source_duration": None, "percentage": 0.05,
+                             "min_duration": 60, "max_duration": 900}]
+    tier = hb.resolve_tier(tiers, source_duration=100)
+    assert tier is tiers[1]
+
+
+def test_resolve_tier_all_entries_malformed_returns_empty_dict():
+    assert hb.resolve_tier(["oops", 5, None], source_duration=100) == {}
+
+
+def test_resolve_adaptive_budget_malformed_tiers_falls_back_to_max_duration():
+    config = {"highlights": {"exact_duration": None, "tiers": "not-a-list", "max_duration": 900}}
+    budget, mode = hb.resolve_adaptive_budget(config, source_duration=1000)
+    assert (budget, mode) == (900.0, "MAX")
+
+
+def test_resolve_selection_constraints_gui_config_exact_duration_zero_wins_over_stale_disk_value():
+    # A user who zeroed out Exact Duration in the GUI (falsy 0, but the key
+    # IS present) must not have a stale nonzero on-disk value resurrected.
+    config = {"highlights": {"selection_mode": "adaptive", "exact_duration": 300, "tiers": TIERS}}
+    gui_config = {"exact_duration": 0}
+    result = hb.resolve_selection_constraints(gui_config, config, video_duration=2700)
+    assert result["duration_mode"] == "MAX"
+    assert result["target_duration"] == pytest.approx(270.0)
+
+
+def test_resolve_selection_constraints_negative_segment_minutes_falls_back_to_default():
+    config = {"highlights": {
+        "selection_mode": "adaptive", "tiers": TIERS,
+        "segment_distribution_enabled": True, "segment_minutes": -5, "segment_cap": 2,
+    }}
+    result = hb.resolve_selection_constraints({}, config, video_duration=5000)
+    bounds = result["segment_bounds"]
+    assert bounds[0] == (0.0, 1800.0)  # falls back to the 30-minute default
+    assert bounds[-1][1] == 5000
+
+
+def test_resolve_selection_constraints_clip_count_min_clamped_to_max():
+    config = {"highlights": {
+        "selection_mode": "adaptive", "tiers": TIERS,
+        "clip_count_min": 50, "clip_count_max": 5,
+    }}
+    result = hb.resolve_selection_constraints({}, config, video_duration=2700)
+    assert result["clip_count_min"] == 5
+    assert result["clip_count_max"] == 5
+
+
+# --- validate_tiers (extracted from the GUI tier editor) --------------------
+
+VALID_ROWS = [
+    {"max_source_duration": 3600, "percentage": 0.10, "min_duration": 120, "max_duration": 600},
+    {"max_source_duration": None, "percentage": 0.025, "min_duration": 300, "max_duration": 1800},
+]
+
+
+def test_validate_tiers_valid_rows_returns_none():
+    assert hb.validate_tiers(VALID_ROWS, clip_min=3, clip_max=20) is None
+
+
+def test_validate_tiers_empty_rows():
+    assert hb.validate_tiers([], clip_min=1, clip_max=1) == "At least one tier is required."
+
+
+def test_validate_tiers_min_greater_than_max():
+    rows = [{"max_source_duration": None, "percentage": 0.1, "min_duration": 900, "max_duration": 600}]
+    error = hb.validate_tiers(rows, clip_min=1, clip_max=1)
+    assert error == "Tier 1: min budget must be ≤ max budget."
+
+
+def test_validate_tiers_not_ascending():
+    rows = [
+        {"max_source_duration": 7200, "percentage": 0.1, "min_duration": 60, "max_duration": 600},
+        {"max_source_duration": 3600, "percentage": 0.1, "min_duration": 60, "max_duration": 600},
+        {"max_source_duration": None, "percentage": 0.1, "min_duration": 60, "max_duration": 600},
+    ]
+    error = hb.validate_tiers(rows, clip_min=1, clip_max=1)
+    assert error == "Tiers must be ordered ascending by 'Up to source'."
+
+
+def test_validate_tiers_missing_fallback():
+    rows = [{"max_source_duration": 3600, "percentage": 0.1, "min_duration": 60, "max_duration": 600}]
+    error = hb.validate_tiers(rows, clip_min=1, clip_max=1)
+    assert error == "The last tier must be the fallback (No limit)."
+
+
+def test_validate_tiers_fallback_not_last():
+    rows = [
+        {"max_source_duration": None, "percentage": 0.1, "min_duration": 60, "max_duration": 600},
+        {"max_source_duration": None, "percentage": 0.1, "min_duration": 60, "max_duration": 600},
+    ]
+    error = hb.validate_tiers(rows, clip_min=1, clip_max=1)
+    assert error == "Only the last tier may be the fallback (No limit)."
+
+
+def test_validate_tiers_clip_min_greater_than_max():
+    error = hb.validate_tiers(VALID_ROWS, clip_min=10, clip_max=5)
+    assert error == "Min clips must be ≤ max clips."

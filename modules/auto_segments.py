@@ -332,43 +332,6 @@ def constrain_regions(regions, score_arr, video_duration, min_dur=1.5, max_dur=3
 
 
 # ---------------------------------------------------------------------------
-# 7. Select non-overlapping regions to fill the duration budget
-# ---------------------------------------------------------------------------
-def select_regions(regions, target_duration, duration_mode="MAX"):
-    """
-    Greedy: pick highest-density regions first, skipping any that TRULY overlap
-    (share time) with an already-selected one. Abutting clips (split sub-windows)
-    are allowed so they can fill the budget back-to-back.
-    """
-    if not regions:
-        return [], []
-
-    for r in regions:
-        r._density = r.score / max(0.5, r.duration)
-
-    ranked = sorted(regions, key=lambda r: (r._density, r.score), reverse=True)
-
-    selected = []
-    total_dur = 0.0
-    for r in ranked:
-        if any(_shares_time(r, sel) for sel in selected):
-            continue
-        remaining = target_duration - total_dur
-        if remaining <= 0:
-            break
-        actual_end = r.end
-        if r.duration > remaining:
-            actual_end = r.start + remaining
-        selected.append(Region(r.start, actual_end, r.score, r.sources))
-        total_dur += actual_end - r.start
-        if duration_mode == "EXACT" and total_dur >= target_duration:
-            break
-
-    selected.sort(key=lambda r: r.start)
-    return [(r.start, r.end) for r in selected], selected
-
-
-# ---------------------------------------------------------------------------
 # 7b. Constrained selection: clip-count bounds, overflow tolerance, segment
 # distribution -- the shared layer both the auto-segmentation path and the
 # fixed-window path (pipeline.py) select through for adaptive highlight
@@ -460,12 +423,18 @@ def select_regions_bounded(
 
         seg_idx = _segment_index(c) if segment_caps_active else None
         if segment_caps_active and seg_idx is not None and seg_counts.get(seg_idx, 0) >= segment_cap:
+            if len(selected) >= clip_count_min:
+                # Cheap check first -- avoid the O(remaining candidates) scan
+                # below on the common path where the minimum is already met.
+                rejected.append((c, "segment cap"))
+                continue
             others_available = any(
                 _segment_index(o) != seg_idx
+                and seg_counts.get(_segment_index(o), 0) < segment_cap
                 and not any(_shares_time(o, s) for s in selected)
                 for o in candidates[pos + 1:]
             )
-            if len(selected) >= clip_count_min or others_available:
+            if others_available:
                 rejected.append((c, "segment cap"))
                 continue
             # else: last resort (R9) -- take it despite the cap
@@ -474,12 +443,18 @@ def select_regions_bounded(
         if remaining <= 0:
             if overflow_pct > 0 and not overflow_used and total <= budget * (1 + overflow_pct):
                 overflow_used = True
+                # Cap the overflow candidate at the overflow ceiling instead
+                # of taking its full duration -- otherwise a single large
+                # candidate can blow past the promised 10% overflow bound
+                # by an arbitrary amount.
+                remaining = max(0.0, budget * (1 + overflow_pct) - total)
             elif len(selected) >= clip_count_min:
                 rejected.append((c, "budget exhausted"))
                 break
             # else: under the minimum -- fall through and take this
-            # candidate as a supplement past budget (R6), full duration
-            # (no truncation; truncation only applies while still in-budget)
+            # candidate as a supplement past budget (R6); remaining stays
+            # <=0 here so it's taken at full duration (no truncation --
+            # truncation only applies when remaining is a positive cap)
 
         actual = c
         if remaining > 0 and c.duration > remaining:

@@ -46,6 +46,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules.highlight_budget import resolve_adaptive_budget, validate_tiers, DEFAULT_TIERS
 # Editor model is stdlib-only (safe at import time); the panel is pure Qt.
 # modules.keyword_scoring (whisper chain) is never imported at module level —
 # the editor's persist gate lazy-imports it.
@@ -1398,26 +1399,9 @@ class VideoHighlighterGUI(QWidget):
                 })
             return rows
 
-        def _tier_validate(rows, clip_min, clip_max):
-            if not rows:
-                return "At least one tier is required."
-            for i, t in enumerate(rows):
-                if t["min_duration"] > t["max_duration"]:
-                    return f"Tier {i+1}: min budget must be ≤ max budget."
-            finite = [t["max_source_duration"] for t in rows if t["max_source_duration"] is not None]
-            if finite != sorted(finite):
-                return "Tiers must be ordered ascending by 'Up to source'."
-            if rows[-1]["max_source_duration"] is not None:
-                return "The last tier must be the fallback (No limit)."
-            if any(t["max_source_duration"] is None for t in rows[:-1]):
-                return "Only the last tier may be the fallback (No limit)."
-            if clip_min > clip_max:
-                return "Min clips must be ≤ max clips."
-            return None
-
         def _tier_revalidate():
             rows = _tier_read_rows()
-            error = _tier_validate(rows, self.spin_clip_count_min.value(), self.spin_clip_count_max.value())
+            error = validate_tiers(rows, self.spin_clip_count_min.value(), self.spin_clip_count_max.value())
             if error:
                 self.tier_error_label.setText(f"⚠ {error}")
                 self._tiers_valid = False
@@ -1432,7 +1416,6 @@ class VideoHighlighterGUI(QWidget):
         def _tier_update_preview():
             # Freezes at the last valid computation while the table is
             # invalid, rather than clearing or erroring (design-lens finding).
-            from modules.highlight_budget import resolve_adaptive_budget
             tiers_for_preview = getattr(self, "_tiers", [])
             self.tier_preview_table.setRowCount(0)
             for dur in _PREVIEW_DURATIONS:
@@ -1453,11 +1436,14 @@ class VideoHighlighterGUI(QWidget):
         # ---- load existing tiers (or shipped defaults) ----
         self._tiers = []
         self._tiers_valid = True
-        _existing_tiers = highlights_cfg.get("tiers") or [
-            {"max_source_duration": 3600, "percentage": 0.10, "min_duration": 120, "max_duration": 600},
-            {"max_source_duration": 14400, "percentage": 0.05, "min_duration": 300, "max_duration": 1200},
-            {"max_source_duration": None, "percentage": 0.025, "min_duration": 300, "max_duration": 1800},
-        ]
+        _raw_tiers = highlights_cfg.get("tiers")
+        # A hand-edited config.yaml can put anything under "tiers" (a dict,
+        # a string, a list with non-dict entries). Filter to well-formed
+        # entries and fall back to the shipped defaults rather than crashing
+        # GUI startup on a malformed shape.
+        _existing_tiers = [t for t in _raw_tiers if isinstance(t, dict)] if isinstance(_raw_tiers, list) else []
+        if not _existing_tiers:
+            _existing_tiers = DEFAULT_TIERS
         self._tiers_loading = True
         for t in _existing_tiers:
             _tier_add_row(

@@ -5,9 +5,10 @@ Covers AE4-AE6 from docs/plans/2026-07-13-001-feat-adaptive-top-x-selection-plan
 """
 
 import numpy as np
+import pytest
 
 from modules.auto_segments import (
-    Region, select_regions, select_regions_bounded, select_fixed_window_segments,
+    Region, select_regions_bounded, select_fixed_window_segments,
     build_auto_segments,
 )
 
@@ -17,11 +18,46 @@ def _regions(*specs):
     return [Region(s, e, sc) for s, e, sc in specs]
 
 
+def _original_select_regions(regions, target_duration, duration_mode="MAX"):
+    """Verbatim reference copy of the deleted modules.auto_segments.select_regions
+    (pre-U2 refactor), kept here as the byte-identical behavior baseline that
+    select_regions_bounded's legacy defaults must reproduce exactly (KTD1)."""
+    def _shares_time(a, b):
+        return min(a.end, b.end) - max(a.start, b.start) > 0.0
+
+    if not regions:
+        return [], []
+
+    for r in regions:
+        r._density = r.score / max(0.5, r.duration)
+
+    ranked = sorted(regions, key=lambda r: (r._density, r.score), reverse=True)
+
+    selected = []
+    total_dur = 0.0
+    for r in ranked:
+        if any(_shares_time(r, sel) for sel in selected):
+            continue
+        remaining = target_duration - total_dur
+        if remaining <= 0:
+            break
+        actual_end = r.end
+        if r.duration > remaining:
+            actual_end = r.start + remaining
+        selected.append(Region(r.start, actual_end, r.score, r.sources))
+        total_dur += actual_end - r.start
+        if duration_mode == "EXACT" and total_dur >= target_duration:
+            break
+
+    selected.sort(key=lambda r: r.start)
+    return [(r.start, r.end) for r in selected], selected
+
+
 # --- legacy-mode byte-identical proof (KTD1 / U2's core correctness claim) --
 
 def test_legacy_defaults_match_select_regions_exactly():
     regions = _regions((0, 10, 5), (20, 30, 3), (50, 60, 8), (12, 18, 1))
-    legacy_pairs, legacy_selected = select_regions(list(regions), target_duration=25, duration_mode="MAX")
+    legacy_pairs, legacy_selected = _original_select_regions(list(regions), target_duration=25, duration_mode="MAX")
 
     # Reproduce select_regions' own ranking (density desc, score desc) as the
     # caller-supplied order -- select_regions_bounded never re-ranks itself.
@@ -40,7 +76,7 @@ def test_legacy_defaults_match_select_regions_exactly():
 
 def test_legacy_defaults_exact_mode_matches_select_regions():
     regions = _regions((0, 10, 5), (10, 20, 3), (20, 30, 8))
-    legacy_pairs, _ = select_regions(list(regions), target_duration=15, duration_mode="EXACT")
+    legacy_pairs, _ = _original_select_regions(list(regions), target_duration=15, duration_mode="EXACT")
 
     for r in regions:
         r._density = r.score / max(0.5, r.duration)
@@ -82,6 +118,18 @@ def test_ae5_at_most_one_overflow_clip():
     assert len(selected2) <= 4  # at most one candidate past the 3 that fit budget
 
 
+def test_ae5_overflow_candidate_is_truncated_to_the_10pct_ceiling():
+    # Regression test: a single oversized overflow candidate must be
+    # truncated to the overflow ceiling, not admitted at full duration
+    # (previously this could push total to several times the intended
+    # budget*(1+overflow_pct) cap).
+    candidates = _regions((0, 100, 10), (100, 300, 1))
+    selected, _ = select_regions_bounded(
+        candidates, budget=100, clip_count_min=0, clip_count_max=20, overflow_pct=0.10)
+    total = sum(r.duration for r in selected)
+    assert total == pytest.approx(110.0)  # budget * (1 + overflow_pct), not 300
+
+
 def test_clip_count_max_stops_selection_before_budget_exhausted():
     candidates = _regions((0, 5, 10), (5, 10, 9), (10, 15, 8), (15, 20, 7))
     selected, _ = select_regions_bounded(
@@ -121,6 +169,25 @@ def test_segment_cap_holds_when_other_segments_have_candidates():
     seg0_selected = [r for r in selected if r.start < 1800]
     assert len(seg0_selected) == 2
     assert any(reason == "segment cap" for _, reason in rejected)
+
+
+def test_segment_cap_last_resort_requires_alternate_segment_itself_under_cap():
+    # Regression test: the "last resort" relaxation must check whether the
+    # alternate-segment candidate's own segment is under its cap, not just
+    # that a same-segment-distinct candidate exists later in the list --
+    # otherwise a higher-score candidate can be wrongly rejected in favor of
+    # a lower-score one that only got selected first by list position.
+    seg0_a = _regions((0, 10, 5))[0]
+    seg0_b = _regions((20, 30, 9))[0]      # higher score -- must survive the cap
+    seg1_a = _regions((1810, 1820, 1))[0]  # fills segment 1's cap first
+    seg1_b = _regions((1830, 1840, 1))[0]  # leftover -- segment 1 is ALSO capped
+    candidates = [seg0_a, seg1_a, seg0_b, seg1_b]
+    segments = [(0, 1800), (1800, 3600)]
+    selected, rejected = select_regions_bounded(
+        candidates, budget=1000, clip_count_min=3, clip_count_max=20,
+        segments=segments, segment_cap=1)
+    assert any(r.score == 9 for r in selected)
+    assert len(selected) == 3
 
 
 def test_segment_distribution_disabled_by_default_matches_unsegmented_path():
